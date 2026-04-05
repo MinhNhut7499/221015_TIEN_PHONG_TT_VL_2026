@@ -1,0 +1,27 @@
+# Python
+myenv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# Model
+*.pth
+
+# Data
+data/
+uploads/
+
+# Node
+node_modules/
+
+# Build
+dist/
+build/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
