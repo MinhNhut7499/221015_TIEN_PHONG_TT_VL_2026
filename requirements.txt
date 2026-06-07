@@ -1,0 +1,75 @@
+# ============================================================
+# Architecture AI Backend — Python dependencies
+# Python 3.10+
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# ── Web framework ─────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+
+# ── Settings / environment ────────────────────────────────────
+pydantic==2.7.1
+pydantic-settings==2.3.0
+python-dotenv==1.0.1
+
+# ── Authentication ────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+bcrypt==4.1.3
+
+# ── HTTP client (Google OAuth calls) ─────────────────────────
+httpx==0.27.0
+
+# ── File upload (multipart/form-data parsing) ─────────────────
+python-multipart==0.0.9
+
+# ── Testing ───────────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6
+
+# ── Development utilities (optional but recommended) ──────────
+# Uncomment when needed:
+# black==24.4.2          # code formatter
+# ruff==0.4.4            # fast linter
+# mypy==1.10.0           # static type checker
+
+# ── Database (SQL Server via SQLAlchemy async) ────────────────
+sqlalchemy[asyncio]==2.0.30
+aioodbc==0.5.2
+pyodbc==5.1.0
+
+# ── LLM SDKs ──────────────────────────────────────────────────
+google-genai==1.75.0
+openai==1.75.0
+pillow==10.3.0
+
+# ── Classical CV attribute extractor (Phase 1) ────────────────
+# Used by chatbot/utils/cv_attributes.py for symmetry / Hough /
+# GLCM / Canny / Sobel features.  All pure CPU, no GPU required.
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+scikit-image==0.24.0
+
+# ── Trained models — inference (CPU-only) ─────────────────────
+# torch / torchvision: ResNet50 backbone for the style prior head
+#   (chatbot/services/global_feature_service.py). Install the CPU
+#   build to avoid CUDA setup on Windows and to stay off the 4GB GPU:
+#     pip install torch==2.2.2 torchvision==0.17.2 \
+#       --index-url https://download.pytorch.org/whl/cpu
+# ultralytics: YOLOv8s component detector
+#   (chatbot/services/yolo_service.py). Pin to the version used to
+#   train best.pt to guarantee checkpoint compatibility.
+torch==2.2.2
+torchvision==0.17.2
+ultralytics==8.2.103
+# Grad-CAM heatmap overlay on the ResNet50 style head
+#   (chatbot/utils/gradcam.py). Enabled via settings.ENABLE_GRADCAM.
+grad-cam==1.5.0
+
+# ── Learned fuser (offline training) ──────────────────────────
+# scikit-learn: the calibrated logistic-regression fuser + risk-coverage
+#   (chatbot/services/fuser_service.py, scripts/train_fuser.py).
+# imagehash: perceptual-hash near-duplicate / leakage check
+#   (scripts/dedup_check.py). joblib ships with scikit-learn.
+scikit-learn==1.5.2
+imagehash==4.3.1

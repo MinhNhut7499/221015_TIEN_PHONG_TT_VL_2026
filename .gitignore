@@ -1,0 +1,30 @@
+# ── Secrets ───────────────────────────────────────────────────
+.env
+frontend/.env
+
+# ── Claude-related (CLI config, rules, project memory) ────────
+.claude/
+CLAUDE.md
+
+# ── Dataset (large image corpus, kept out of git) ─────────────
+data/
+
+# ── Node / frontend build ─────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+.dist/
+
+# ── Trained model weights (large binaries, keep out of git) ───
+*.pt
+models/
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── Uploads / scratch ─────────────────────────────────────────
+utils/upload_temp/
+utils/download/
