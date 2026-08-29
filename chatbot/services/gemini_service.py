@@ -19,21 +19,27 @@ class GeminiService:
     Uses the google-genai SDK (async-native) for vision + text generation.
     """
 
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash") -> None:
+    def __init__(self, api_key: str, model: str = "gemini-3.5-flash") -> None:
         """Configure the Gemini client.
 
         Args:
             api_key: Google AI Studio API key.
-            model: Gemini model name (default: gemini-2.5-flash).
+            model: Gemini model name (default: gemini-3.5-flash).
         """
         self._client = genai.Client(api_key=api_key)
         self._model_name = model
+
+    @property
+    def model_name(self) -> str:
+        """Return the configured model name (single source for telemetry labels)."""
+        return self._model_name
 
     async def generate_with_image(
         self,
         prompt: str,
         image_base64: str,
         temperature: float = 0.7,
+        json_mode: bool = False,
     ) -> str:
         """Send a prompt with an embedded image to Gemini and return raw text.
 
@@ -41,6 +47,9 @@ class GeminiService:
             prompt: Text instruction for the model.
             image_base64: Base64-encoded JPEG image string.
             temperature: Sampling temperature (higher = more creative).
+            json_mode: When True, force ``response_mime_type="application/json"``
+                so the output is always parseable — used by the Gemini VISION
+                panel judge (the prompt must mention JSON).
 
         Returns:
             Raw text response from Gemini.
@@ -51,16 +60,57 @@ class GeminiService:
         image_bytes = base64.b64decode(image_base64)
         image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
 
+        config_kwargs: dict = {"temperature": temperature}
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
         response = await with_retry(
             lambda: self._client.aio.models.generate_content(
                 model=self._model_name,
                 contents=[prompt, image_part],
-                config=types.GenerateContentConfig(temperature=temperature),
+                config=types.GenerateContentConfig(**config_kwargs),
             ),
             attempts=settings.LLM_MAX_RETRIES + 1,
             base_delay=settings.LLM_RETRY_BASE_DELAY_SEC,
         )
 
+        if not response.text:
+            raise RuntimeError(
+                f"Gemini returned empty response for model {self._model_name}"
+            )
+        return response.text.strip()
+
+    async def generate_text(
+        self, prompt: str, temperature: float = 0.4, json_mode: bool = False
+    ) -> str:
+        """Send a text-only prompt (no image) to Gemini and return raw text.
+
+        Used for the Gemini panel judge in the consensus stage. When
+        ``json_mode`` is True the response MIME type is forced to JSON so the
+        output is always parseable.
+
+        Args:
+            prompt: Text instruction for the model.
+            temperature: Sampling temperature.
+            json_mode: Force ``response_mime_type="application/json"``.
+
+        Returns:
+            Raw text response from Gemini.
+
+        Raises:
+            RuntimeError: If Gemini returns an empty or blocked response.
+        """
+        config_kwargs = {"temperature": temperature}
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+        response = await with_retry(
+            lambda: self._client.aio.models.generate_content(
+                model=self._model_name,
+                contents=[prompt],
+                config=types.GenerateContentConfig(**config_kwargs),
+            ),
+            attempts=settings.LLM_MAX_RETRIES + 1,
+            base_delay=settings.LLM_RETRY_BASE_DELAY_SEC,
+        )
         if not response.text:
             raise RuntimeError(
                 f"Gemini returned empty response for model {self._model_name}"

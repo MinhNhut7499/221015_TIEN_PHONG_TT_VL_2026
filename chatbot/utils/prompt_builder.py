@@ -1,343 +1,138 @@
-"""Prompt construction for the 7-agent architecture analysis pipeline.
+"""Prompt construction for the open-vocabulary architecture analysis pipeline.
 
-All functions are pure string builders — no I/O, no LLM calls.
-Each function corresponds to one agent's prompt strategy documented in the plan.
+All functions are pure string builders — no I/O, no LLM calls. The pipeline
+stages are:
+
+- Agent A (Gemini vision)   → fill a structured EVIDENCE SHEET (12 dimensions)
+- KB grounding (pure code)  → resolve proposed style names to KB candidates
+- Panel (3 judges)          → each independently scores the candidates → mixture
+- Agent 7 (GPT-4o + image)  → arbiter: final mixture grounded in evidence + KB
 """
 import json
 from typing import Any, Dict, List, Optional
 
-from chatbot.utils.schemas import (
-    Agent5Output,
-    Agent6Output,
-    AttributeVector,
-    MATERIAL_CLASSES,
-    MaterialDistribution,
-    STYLE_CLASSES,
-)
+from chatbot.utils.schemas import EvidenceSheet, PanelVerdict, StyleEntry
 
 
-_STYLE_LIST = ", ".join(STYLE_CLASSES)
-_MATERIAL_LIST = ", ".join(MATERIAL_CLASSES)
-
-# Guidance for commonly-confused style pairs, injected into Agent 7's CoT.
-# Targets the observed Art Nouveau→Gothic error: verticality + ornamentation
-# alone must NOT default to Gothic — curvature/symmetry/organic-vs-geometric
-# ornament and component evidence are the real discriminators.
-_CONFUSABLE_GUIDANCE = (
-    "DISCRIMINATOR — commonly-confused pairs (do not rely on a single cue):\n"
-    "- Gothic vs Art Nouveau: BOTH can look tall + ornate, so verticality + "
-    "ornamentation ALONE is NOT evidence for Gothic. Gothic = pointed arches, "
-    "spires, vertical STONE tracery, GEOMETRIC repetition, moderate-high "
-    "symmetry, LOW organic curvature. Art Nouveau = WHIPLASH/organic curves, "
-    "ASYMMETRY, curved iron balconies, sinuous floral ornament, HIGH curvature "
-    "+ HIGH edge-orientation entropy. Decisive components: spire → Gothic; "
-    "curved_iron_balcony → Art Nouveau.\n"
-    "- Art Deco vs Neoclassical: both symmetric + vertical; Art Deco = "
-    "geometric/zigzag ornament, setbacks; Neoclassical = columns/pediments, "
-    "plain surfaces.\n\n"
-)
+# The 12 evidence-sheet dimensions Agent A must consider, with a short hint
+# each so the VLM knows what to look at. Order is the reading order in prompts.
+EVIDENCE_DIMENSIONS: List[tuple[str, str]] = [
+    ("massing", "overall volume/silhouette and how blocks are composed"),
+    ("roof", "roof form: flat, pitched, domed, onion, hipped, spire, shikhara…"),
+    ("supports", "columns, piers, walls, buttresses, pilotis — vertical supports"),
+    ("arch", "arch/opening shape: pointed, round, horseshoe, ogee, trabeated…"),
+    ("openings", "windows and doors: proportion, rhythm, tracery, rose window…"),
+    ("facade", "facade composition: symmetry, bays, layering, articulation"),
+    ("ornament", "ornament type/density: floral, geometric, figural, plain…"),
+    ("material", "visible facade materials: stone, brick, concrete, glass, wood…"),
+    ("verticals", "vertical vs horizontal emphasis of the composition"),
+    ("vault_dome", "vaults/domes/ceilings if visible (ribbed, coffered, muqarnas…)"),
+    ("spatial_org", "plan/spatial organisation cues (axial, central, courtyard…)"),
+    ("diagnostic", "the single MOST distinctive, style-revealing feature present"),
+]
 
 
-def build_material_prompt() -> str:
-    """Prompt for the Gemini-backed material classifier (VQA-style, BMAT-like).
+def build_agent_a_prompt(family_names: Optional[List[str]] = None) -> str:
+    """Agent A (vision): fill the structured 12-dimension evidence sheet.
 
-    Asks the model to look at the central building in the attached image and
-    return a JSON object with two parts: a probability ``distribution`` over the
-    5 controlled MaterialType classes (sums to ~1.0) and an ``observed_materials``
-    list of the actual materials seen — including ones outside the 5 classes.
-    """
-    example = (
-        '{"distribution": {"concrete": 0.6, "glass": 0.2, "stone": 0.1, '
-        '"brick": 0.05, "metal": 0.05}, '
-        '"observed_materials": ["exposed concrete", "glass curtain wall"]}'
-    )
-    return (
-        "You are an expert in building construction materials.\n"
-        "Look at the CENTRAL building in the attached image and identify its "
-        "facade materials.\n\n"
-        f"Controlled material classes: {_MATERIAL_LIST}\n\n"
-        "Return ONLY a valid JSON object, no explanation, with exactly two keys:\n"
-        f'1. "distribution": probability scores (0.0-1.0) over the {len(MATERIAL_CLASSES)} '
-        "controlled classes above. Scores must sum to 1.0.\n"
-        '2. "observed_materials": a list of the materials you actually see, in '
-        "free text — include specific or out-of-list materials when relevant "
-        '(e.g. "weathered steel", "terracotta", "wood", "stucco").\n\n'
-        f"Example:\n{example}"
-    )
-
-
-def _format_observed_materials(material: MaterialDistribution) -> str:
-    """One-line free-text material cue, or '' when none were observed.
-
-    Surfaces the vision backend's free-form material observations (possibly
-    outside the 5 controlled classes) so the LLM agents can use fine-grained
-    cues such as ``weathered steel`` or ``board-formed concrete``.
-    """
-    if not material.observed_materials:
-        return ""
-    return f"Observed materials (free-form): {', '.join(material.observed_materials)}\n"
-
-
-def _format_material_stream(
-    material: MaterialDistribution,
-    material_available: bool,
-    label: str = "EVIDENCE STREAM 2",
-) -> str:
-    """Render the material evidence block, or an 'unavailable' note.
-
-    When ``material_available`` is False (the classifier is the deterministic
-    mock), the material signal is pure noise — so it is withheld from the LLM
-    rather than presented as evidence, which would otherwise inflate hedging.
-    """
-    if not material_available:
-        return (
-            f"{label} — Material: unavailable "
-            "(classifier is mock; not used this run).\n\n"
-        )
-    material_dist_str = ", ".join(
-        f"{m}: {p:.2f}"
-        for m, p in sorted(material.distribution.items(), key=lambda x: x[1], reverse=True)
-    )
-    return (
-        f"{label} — Material classifier: dominant={material.dominant} "
-        f"(confidence {material.confidence:.2f})\n"
-        f"  Distribution: {material_dist_str}\n"
-        f"{_format_observed_materials(material)}\n"
-    )
-
-
-def _format_fused_anchor(fused_prior: Optional[Dict[str, float]]) -> str:
-    """Render the numeric fused prior as a starting-point anchor, or '' if None."""
-    if not fused_prior:
-        return ""
-    return (
-        "NUMERIC FUSED PRIOR (component votes + CNN prior; attribute = tie-break) "
-        "— START HERE:\n"
-        f"{_format_score_dict(fused_prior)}\n"
-        "  This is the deterministic baseline. Adjust it ONLY when the evidence "
-        "above gives a strong, specific reason; otherwise stay close to it.\n\n"
-    )
-
-
-def _format_attributes_compact(attributes: AttributeVector) -> str:
-    """Single-line attribute summary for per-component prompts (Agent 2/4).
-
-    Optimised for low token cost — used inside Agent 2 prompts which run
-    ×3 (Monte Carlo) per component.
-    """
-    return (
-        f"symmetry={attributes.symmetry_score:.2f}, "
-        f"vert/horiz={attributes.vertical_dominance:.2f}/"
-        f"{attributes.horizontal_dominance:.2f}, "
-        f"curvature={attributes.curvature_score:.2f}, "
-        f"roughness={attributes.surface_roughness:.2f}, "
-        f"edge_density={attributes.edge_density:.2f}, "
-        f"edge_entropy={attributes.edge_orientation_entropy:.2f}"
-    )
-
-
-def _format_attributes_verbose(attributes: AttributeVector) -> str:
-    """Multi-line attribute block with units for cross-component prompts (Agent 5/7).
-
-    Includes scale hints so the LLM can calibrate the values without
-    extra explanation in the surrounding prose.
-    """
-    return (
-        "Building-level visual attributes (full image, classical CV):\n"
-        f"  symmetry_score:           {attributes.symmetry_score:.3f}"
-        "  (0.0–1.0; 1.0 = perfect mirror-symmetry)\n"
-        f"  vertical_dominance:       {attributes.vertical_dominance:.3f}"
-        "  (0.0–1.0; share of vertical lines via Hough)\n"
-        f"  horizontal_dominance:     {attributes.horizontal_dominance:.3f}"
-        "  (0.0–1.0; share of horizontal lines via Hough)\n"
-        f"  curvature_score:          {attributes.curvature_score:.3f}"
-        "  (0.0–1.0; share of curved structure)\n"
-        f"  surface_roughness:        {attributes.surface_roughness:.3f}"
-        "  (0.0–1.0; GLCM contrast — Haralick texture)\n"
-        f"  edge_density:             {attributes.edge_density:.3f}"
-        "  (0.0–1.0; multi-scale Canny — proxy for ornament amount)\n"
-        f"  edge_orientation_entropy: {attributes.edge_orientation_entropy:.3f}"
-        "  (0.0–2.89; low = geometric ornament, high = organic curves)"
-    )
-
-
-def build_agent1_prompt(component_type: str) -> str:
-    """Agent 1 (Gemini vision): describe geometric features without naming a style.
+    Returns a prompt instructing the model to describe the building across all
+    evidence dimensions and propose OPEN-VOCABULARY style names (it may name any
+    world style, not a fixed list), plus a ranked building-level
+    ``style_hypotheses`` and 2-3 building-level ``families`` chosen from the
+    knowledge-base family list (coarse-to-fine — a family is easier to get right
+    than the exact style, and the orchestrator expands it into candidates). No
+    confidence numbers and no bounding boxes are requested — both are unreliable.
 
     Args:
-        component_type: YOLO label for the detected component (e.g. "dome").
-
-    Returns:
-        Prompt string instructing Gemini to describe visual geometry only.
+        family_names: KB family display names to constrain the ``families`` field
+            to (e.g. "Islamic", "East Asian"). When None/empty the families
+            instruction is omitted (backward compatible).
     """
-    return (
-        f"You are an architectural expert analysing a cropped region of a building photograph.\n"
-        f"The detected component type is: {component_type}\n\n"
-        "Describe the GEOMETRIC and VISUAL features of this component in detail:\n"
-        "- Shape, proportions, curvature\n"
-        "- Materials visible (stone, concrete, glass, iron…)\n"
-        "- Surface texture and ornamental details\n"
-        "- Structural role it appears to serve\n\n"
-        "IMPORTANT: Do NOT name any architectural style. Describe only what you see geometrically."
+    dim_lines = "\n".join(
+        f"  - {name}: {hint}" for name, hint in EVIDENCE_DIMENSIONS
     )
-
-
-def build_agent2_prompt(
-    component_type: str,
-    feature_description: str,
-    material: MaterialDistribution,
-    attributes: Optional[AttributeVector] = None,
-    material_available: bool = True,
-) -> str:
-    """Agent 2 (Gemini ×3 Monte Carlo): assign style probability distribution.
-
-    Called three times with different temperatures; caller averages the results.
-
-    Args:
-        component_type: YOLO label for the component.
-        feature_description: Output from Agent 1.
-        material: Building-level material classification from YOLOv8s-cls.
-        attributes: Optional building-level visual attributes from the global
-            feature extractor. When provided, the values are injected as a
-            compact one-line summary so Agent 2 can ground its per-component
-            style scoring in whole-building geometry and texture context.
-
-    Returns:
-        Prompt string asking for a JSON probability distribution over 10 styles.
-    """
-    if material_available:
-        material_line = (
-            f"Building dominant material: {material.dominant} "
-            f"(confidence {material.confidence:.2f})\n"
-            f"{_format_observed_materials(material)}"
-        )
-        material_phrase = "the building material"
-    else:
-        material_line = "Building material: unavailable (not assessed this run)\n"
-        material_phrase = None
-
-    if attributes is not None:
-        attribute_block = (
-            f"Building-level visual cues (whole image): "
-            f"{_format_attributes_compact(attributes)}\n"
-        )
-        cues = ["the component features"]
-        if material_phrase:
-            cues.append(material_phrase)
-        cues.append("the building-level visual cues above")
-        evidence_list = ", ".join(cues[:-1]) + f" AND {cues[-1]}"
-    else:
-        attribute_block = ""
-        evidence_list = (
-            f"the component features and {material_phrase} above"
-            if material_phrase
-            else "the component features above"
-        )
-    return (
-        f"You are an architectural historian.\n"
-        f"Component type: {component_type}\n"
-        f"Feature description: {feature_description}\n"
-        f"{material_line}"
-        f"{attribute_block}"
-        f"\nGiven {evidence_list}, assign probability scores (0.0–1.0) "
-        f"to each of the following architectural styles. Scores must sum to 1.0.\n\n"
-        f"Styles: {_STYLE_LIST}\n\n"
-        "Respond with ONLY a valid JSON object, no explanation. Example:\n"
-        '{"Gothic": 0.7, "Baroque": 0.1, "Renaissance": 0.0, '
-        '"Neoclassical": 0.05, "Art Nouveau": 0.0, "Art Deco": 0.0, '
-        '"Modernism": 0.0, "Deconstructivism": 0.05, "Brutalism": 0.1, "High-tech": 0.0}'
-    )
-
-
-def build_agent3b_prompt(
-    component_type: str,
-    style_distribution: Dict[str, float],
-    top_style: str,
-) -> str:
-    """Agent 3b (DeepSeek): parse contradiction analysis when hard rules flag an issue.
-
-    Only called when Agent 3a detects a rule violation and needs LLM interpretation.
-
-    Args:
-        component_type: YOLO label for the component.
-        style_distribution: Agent 2's averaged style distribution.
-        top_style: Highest-scoring style from Agent 2.
-
-    Returns:
-        Prompt asking DeepSeek to analyse the contradiction and return JSON.
-    """
-    dist_str = ", ".join(f"{k}: {v:.2f}" for k, v in style_distribution.items())
-    return (
-        f"You are an architectural analyst reviewing a classification conflict.\n\n"
-        f"Component detected: {component_type}\n"
-        f"Style distribution from visual analysis: {{{dist_str}}}\n"
-        f"Top predicted style: {top_style}\n\n"
-        f"A hard architectural rule flags a potential contradiction between the "
-        f"component type '{component_type}' and the predicted style '{top_style}'.\n\n"
-        "Analyse whether this is a genuine contradiction or can be explained "
-        "(e.g. eclectic building, transitional period, photographing error).\n\n"
-        "Respond with ONLY a valid JSON object:\n"
-        '{"has_contradiction": true|false, '
-        '"contradiction_analysis": "your analysis here", '
-        '"violated_rules": ["rule1", "rule2"]}'
-    )
-
-
-def build_agent4_prompt(
-    component_type: str,
-    top3_styles: List[str],
-    style_distribution: Dict[str, float],
-    has_contradiction: bool,
-    contradiction_analysis: str,
-) -> str:
-    """Agent 4 (DeepSeek): per-component MIXTURE distribution + reasoning.
-
-    Agent 4 used to emit a single ``style + confidence`` label. In the
-    multi-style mixture architecture it instead emits a probability
-    distribution over the styles it considers plausible for this single
-    component. The downstream caller derives the legacy ``style``/
-    ``confidence`` fields from the primary entry of that distribution.
-
-    Args:
-        component_type: YOLO label.
-        top3_styles: Top 3 styles from Agent 2 distribution (hint, not a
-            hard constraint — Agent 4 may choose any styles from the full
-            list).
-        style_distribution: Full Agent 2 distribution for context.
-        has_contradiction: Whether Agent 3 flagged a contradiction.
-        contradiction_analysis: Agent 3's analysis text.
-
-    Returns:
-        Prompt asking for a JSON conclusion with a per-component
-        ``style_distribution`` (top-K, sum=1) and ``reasoning``.
-    """
-    dist_str = ", ".join(f"{k}: {v:.2f}" for k, v in style_distribution.items())
-    contradiction_note = (
-        f"\nNOTE: A contradiction was detected — {contradiction_analysis}\n"
-        "Reflect this uncertainty by spreading probability mass across "
-        "multiple plausible styles instead of concentrating it on one."
-        if has_contradiction
+    families_csv = ", ".join(family_names) if family_names else ""
+    families_instr = (
+        ('Also add "families": the 2-3 broad architectural FAMILIES the building '
+         "most likely belongs to, chosen ONLY from this list: "
+         f"{families_csv}. A family is a coarse grouping (easier to judge than "
+         "the exact style); pick the ones whose typical buildings look most like "
+         "this one.\n")
+        if families_csv
         else ""
     )
-    return (
-        f"You are an architectural style classifier reasoning about ONE "
-        f"component of a building.\n\n"
-        f"Component: {component_type}\n"
-        f"Agent 2 style distribution: {{{dist_str}}}\n"
-        f"Agent 2 top 3 candidates: {', '.join(top3_styles)}\n"
-        f"{contradiction_note}\n\n"
-        f"Available styles: {_STYLE_LIST}\n\n"
-        "Output a probability distribution that reflects which style(s) this "
-        "component supports. The distribution should:\n"
-        "- Include 1 to 4 styles (omit those you consider implausible)\n"
-        "- Have probabilities that sum to ~1.0\n"
-        "- Concentrate mass on one style if the evidence is decisive\n"
-        "- Spread mass across 2-3 styles if the component is genuinely "
-        "ambiguous or eclectic\n\n"
-        "Respond with ONLY a valid JSON object:\n"
-        '{"style_distribution": {"Gothic": 0.7, "Renaissance": 0.2, '
-        '"Baroque": 0.1}, "reasoning": "explanation"}'
+    families_example = (
+        '  "families": ["Medieval European"],\n' if families_csv else ""
     )
+    example = (
+        "```json\n"
+        "{\n"
+        '  "items": [\n'
+        "    {\n"
+        '      "dimension": "arch",\n'
+        '      "feature": "pointed (lancet) arches over the portals and windows",\n'
+        '      "suggested_styles": ["Gothic"],\n'
+        '      "note": "pointed arch distinguishes from round-arched Romanesque"\n'
+        "    },\n"
+        "    {\n"
+        '      "dimension": "supports",\n'
+        '      "feature": "flying buttresses along the side aisles",\n'
+        '      "suggested_styles": ["Gothic", "French Gothic"],\n'
+        '      "note": ""\n'
+        "    }\n"
+        "  ],\n"
+        '  "style_hypotheses": ["French Gothic", "Gothic", "Gothic Revival"],\n'
+        f"{families_example}"
+        '  "proposed_styles": ["Gothic", "French Gothic", "Romanesque"],\n'
+        '  "overall_note": "large religious building with strong Gothic cues"\n'
+        "}\n"
+        "```"
+    )
+    return (
+        "You are an expert architectural historian examining ONE building photograph.\n"
+        "Fill a structured EVIDENCE SHEET describing what you actually SEE. Do NOT "
+        "jump to a single conclusion — record observations per dimension.\n\n"
+        "Evidence dimensions to cover (include an item for every dimension you can "
+        "observe; skip one only if it is genuinely not visible):\n"
+        f"{dim_lines}\n\n"
+        "For EACH item provide:\n"
+        '  - "dimension": one of the names above.\n'
+        '  - "feature": a concrete description of what you see for that dimension.\n'
+        '  - "suggested_styles": a list of architectural style names this feature '
+        "points to. Use OPEN VOCABULARY — name ANY world style (e.g. Mughal, "
+        "Khmer, Byzantine, Shinto, Art Nouveau…), not a fixed list. May be empty.\n"
+        '  - "note": optional short remark (e.g. what it distinguishes from).\n\n'
+        "Do NOT output any confidence score or probability, and do NOT output "
+        "bounding boxes or coordinates — only observations.\n\n"
+        'After the items, add "style_hypotheses": your 3-6 BEST GUESSES for the '
+        "WHOLE building's style, RANKED most-likely first and ordered SPECIFIC → "
+        "GENERAL. Name the precise regional/period variant when you can (e.g. "
+        '"Spanish Colonial Revival", "Mission Revival", "Venetian Gothic", '
+        '"Mughal") and then its broader family. This is a building-level judgement '
+        "— do NOT just repeat the per-dimension cues, which tend to be generic.\n"
+        f"{families_instr}"
+        'Then add "proposed_styles" (every style name from style_hypotheses AND the '
+        'per-item suggestions, de-duplicated) and "overall_note" (one-sentence '
+        "holistic impression).\n\n"
+        "Return ONLY a fenced JSON block in exactly this shape:\n"
+        f"{example}"
+    )
+
+
+def _format_evidence_sheet(sheet: Optional[EvidenceSheet]) -> str:
+    """Render an EvidenceSheet as a readable evidence block for text agents."""
+    if sheet is None or not sheet.items:
+        return "EVIDENCE SHEET: (empty — no structured evidence extracted)\n"
+    lines: List[str] = ["EVIDENCE SHEET (per-dimension observations):"]
+    for item in sheet.items:
+        styles = ", ".join(item.suggested_styles) if item.suggested_styles else "—"
+        line = f"  - [{item.dimension}] {item.feature} → {styles}"
+        if item.note:
+            line += f" ({item.note})"
+        lines.append(line)
+    if sheet.overall_note:
+        lines.append(f"  Overall: {sheet.overall_note}")
+    return "\n".join(lines) + "\n"
 
 
 def _format_score_dict(scores: Dict[str, float], top_n: Optional[int] = None) -> str:
@@ -351,239 +146,307 @@ def _format_score_dict(scores: Dict[str, float], top_n: Optional[int] = None) ->
     return "\n".join(f"  {style}: {score:.3f}" for style, score in items)
 
 
-def build_agent5_prompt(
-    vote_table: Dict[str, float],
-    component_summaries: List[str],
-    material: MaterialDistribution,
-    style_prior: Optional[Dict[str, float]] = None,
-    attribute_affinity: Optional[Dict[str, float]] = None,
-    attributes: Optional[AttributeVector] = None,
-    material_available: bool = True,
-    fused_prior: Optional[Dict[str, float]] = None,
+# Shown only when an out-of-KB ("PROPOSED") candidate is present, so judges treat
+# it on visual evidence alone without over-favouring or dismissing it.
+_PROPOSED_CANDIDATE_NOTE = (
+    "NOTE: candidates marked PROPOSED are NOT in the curated knowledge base — "
+    "they were suggested from the image and have only the observed features above "
+    "to go on. Score them strictly on the visual evidence, exactly like the other "
+    "candidates: neither favour them for being novel nor dismiss them for lacking "
+    "a KB entry.\n\n"
+)
+
+
+def _format_candidates(candidate_kb_text: str, candidate_names: List[str]) -> str:
+    """Render the KB candidate block, falling back to a bare name list."""
+    if candidate_kb_text.strip():
+        return candidate_kb_text
+    if candidate_names:
+        return "\n".join(f"- {n}" for n in candidate_names)
+    return "(no KB candidates matched — judge from the evidence sheet alone)"
+
+
+def build_panel_judge_prompt(
+    evidence_sheet: Optional[EvidenceSheet],
+    candidate_names: List[str],
+    candidate_kb_text: str,
+    evidence_votes: Dict[str, float],
 ) -> str:
-    """Agent 5 (DeepSeek): primary advocate — emit a STYLE MIXTURE distribution.
+    """One panel judge: independently score the KB candidates into a mixture.
 
-    Agent 5 fuses four independent evidence streams and proposes a
-    distribution over styles plus a composition narrative. The legacy
-    single-label ``style``/``confidence`` are derived downstream from the
-    primary entry of the emitted distribution.
-
-    Args:
-        vote_table: Aggregated weighted votes across all components.
-        component_summaries: Brief per-component conclusions from Agent 4.
-        material: Building-level material classification (YOLOv8s-cls).
-        style_prior: Optional 10-dim CNN style prior P(style|image) from the
-            ResNet50 head. When ``None`` this evidence stream is omitted.
-        attribute_affinity: Optional 10-dim cosine similarity between the
-            observed AttributeVector and ``STYLE_ATTRIBUTE_PROFILES``.
-        attributes: Optional building-level AttributeVector for the verbose
-            attribute block.
-
-    Returns:
-        Prompt asking for a JSON ``style_distribution`` + ``composition_narrative``.
+    The SAME prompt + the SAME building image is given to each of the three
+    vision judges (Gemini / OpenAI / Grok); they do not see each other's output,
+    so their verdicts are independent and their agreement is meaningful. Each
+    judge LOOKS AT THE IMAGE and uses the structured evidence sheet as a
+    reasoning scaffold, plus the KB candidate descriptions and a SOFT
+    evidence-vote table (a ranking hint, NOT a probability). Emits a JSON style
+    mixture over the candidate names plus a short justification.
     """
-    vote_str = _format_score_dict(vote_table)
-    summaries_str = "\n".join(f"- {s}" for s in component_summaries)
-    stream2 = _format_material_stream(material, material_available)
-
-    stream3 = (
-        "EVIDENCE STREAM 3 — CNN global style prior P(style|image) from ResNet50:\n"
-        f"{_format_score_dict(style_prior)}\n\n"
-        if style_prior is not None
+    candidates_block = _format_candidates(candidate_kb_text, candidate_names)
+    names_csv = ", ".join(candidate_names) if candidate_names else "(none)"
+    proposed_note = _PROPOSED_CANDIDATE_NOTE if "PROPOSED" in candidates_block else ""
+    votes_block = (
+        "Evidence-support tally (how many evidence dimensions mention each style — "
+        "a SOFT ranking hint only, NOT a probability; dimensions are not fully "
+        "independent):\n"
+        f"{_format_score_dict(evidence_votes)}\n\n"
+        if evidence_votes
         else ""
     )
-    stream4 = (
-        "EVIDENCE STREAM 4 — Attribute-profile affinity — TIE-BREAKER ONLY "
-        "(hand-crafted prototypes, LOW discriminative power):\n"
-        f"{_format_score_dict(attribute_affinity)}\n"
-        "  Use ONLY to break a near-tie between styles already ranked close by "
-        "the component votes + CNN prior. Do NOT let it override them.\n\n"
-        if attribute_affinity is not None
-        else ""
-    )
-    attribute_block = (
-        f"{_format_attributes_verbose(attributes)}\n\n"
-        if attributes is not None
-        else ""
-    )
-    anchor_block = _format_fused_anchor(fused_prior)
-
     return (
-        "You are an architectural historian analysing the style of a building. "
-        "Many buildings combine influences from multiple periods — your task is "
-        "to output a probability MIXTURE over styles, not a single label.\n\n"
-        f"EVIDENCE STREAM 1 — Component vote table "
-        f"(normalised weighted votes):\n{vote_str}\n\n"
-        f"{stream2}"
-        f"{stream3}{stream4}{attribute_block}"
-        f"{anchor_block}"
-        f"Per-component analysis summaries:\n{summaries_str}\n\n"
-        f"Available styles: {_STYLE_LIST}\n\n"
-        "Output a style mixture distribution that reflects the joint evidence:\n"
-        "- Include 1 to 4 styles (omit those that are implausible)\n"
+        "You are an independent expert judge in a panel of architectural "
+        "historians. Many buildings combine influences from multiple "
+        "periods/cultures — output a probability MIXTURE over styles, not a "
+        "single label. You ARE shown the full building image (attached): look at "
+        "it directly and treat the evidence sheet below as a structured reasoning "
+        "aid, not a replacement for your own reading. You do not see the other "
+        "judges' opinions.\n\n"
+        f"{_format_evidence_sheet(evidence_sheet)}\n"
+        "CANDIDATE STYLES (grounded in the knowledge base — score among these):\n"
+        f"{candidates_block}\n\n"
+        f"{proposed_note}"
+        f"{votes_block}"
+        "Decide a style mixture that the IMAGE and the evidence sheet best "
+        "support:\n"
+        f"- Use ONLY the candidate style names above: {names_csv}\n"
+        "- Include 1 to 4 styles; omit implausible ones\n"
         "- Probabilities must sum to ~1.0\n"
-        "- Concentrate mass when all evidence streams converge\n"
-        "- Spread mass when streams disagree or the building is eclectic\n"
-        "- Cite specific cross-stream evidence in the composition narrative\n\n"
+        "- Weigh by how much of the building each style GOVERNS: the main "
+        "mass/body and overall facade outweigh an isolated accent (a single "
+        "striking roofline, tower, or ornament). Do not let one exotic detail "
+        "dominate when the body clearly belongs to another style.\n"
+        "- Concentrate mass when the evidence converges; spread it when the "
+        "building is genuinely eclectic or the evidence is mixed\n"
+        "- Justify using SPECIFIC evidence-sheet observations (cite the dimension "
+        "and feature), not the vote tally alone\n\n"
         "Respond with ONLY a valid JSON object:\n"
-        '{"style_distribution": {"Gothic": 0.55, "Renaissance": 0.28, '
-        '"Baroque": 0.17}, '
-        '"composition_narrative": "Dominant Gothic with Renaissance influence because..."}'
+        '{"style_distribution": {"Gothic": 0.7, "Romanesque": 0.3}, '
+        '"reasoning": "Dominant Gothic because… with a Romanesque undertone in…"}'
     )
 
 
-def build_agent6_prompt(agent5_style: str) -> str:
-    """Agent 6 (DeepSeek): alternative hypothesist — weak adversarial check.
+def _format_panel_verdicts(verdicts: List[PanelVerdict]) -> str:
+    """Render the panel's verdicts (one block per judge) for the arbiter prompt."""
+    blocks: List[str] = []
+    for v in verdicts:
+        if v.failed or v.style_distribution is None:
+            blocks.append(f"Judge [{v.judge}]: (no verdict — call failed)")
+            continue
+        blocks.append(
+            f"Judge [{v.judge}] mixture:\n"
+            f"{_format_score_dict(v.style_distribution.distribution)}\n"
+            f"  Reasoning: {v.reasoning}"
+        )
+    return "\n\n".join(blocks) if blocks else "(no panel verdicts available)"
 
-    Intentionally receives ONLY Agent 5's label to avoid anchoring bias.
-    Must construct its own independent chain of reasoning.
 
-    Args:
-        agent5_style: The style label chosen by Agent 5 (no reasoning passed).
-
-    Returns:
-        Prompt asking for the best alternative style hypothesis.
-    """
+def _format_free_read(free_read_styles: Optional[List[str]]) -> str:
+    """Render the free-read opinion block for the arbiter prompt (empty if none)."""
+    names = [s for s in (free_read_styles or []) if s and s.strip()]
+    if not names:
+        return ""
+    most_likely = names[0]
+    alternates = ", ".join(names[1:]) if len(names) > 1 else "(none)"
     return (
-        "You are an architectural historian providing an alternative interpretation.\n\n"
-        f"Another analyst concluded: '{agent5_style}'\n\n"
-        f"Available styles: {_STYLE_LIST}\n\n"
-        "What is the SECOND most plausible style? You must propose an alternative — "
-        "do not simply agree with the first analyst. "
-        "Build your own case independently without using the first analyst's reasoning.\n\n"
-        "Respond with ONLY a valid JSON object:\n"
-        '{"style": "StyleName", "confidence": 0.6, "reasoning": "your independent reasoning"}'
+        "INDEPENDENT FREE READ — a separate expert model named the style DIRECTLY "
+        "from the image, WITHOUT the candidate list or the evidence sheet (a "
+        "fresh, unconstrained opinion whose errors are independent of the panel):\n"
+        f"  most likely: {most_likely}; alternates: {alternates}\n"
+        "Weigh it as one more independent vote — it is especially informative when "
+        "it agrees with a candidate the panel underweighted, or when it offers the "
+        "plain canonical style for a building the panel split into fine variants.\n\n"
     )
 
 
 def build_agent7_prompt(
-    agent5: Agent5Output,
-    agent6: Agent6Output,
-    vote_table: Dict[str, float],
-    material: MaterialDistribution,
-    style_prior: Optional[Dict[str, float]] = None,
-    attribute_affinity: Optional[Dict[str, float]] = None,
-    attributes: Optional[AttributeVector] = None,
-    material_available: bool = True,
-    cross_check_note: Optional[str] = None,
-    fused_prior: Optional[Dict[str, float]] = None,
+    panel_verdicts: List[PanelVerdict],
+    panel_agreement: Optional[float],
+    evidence_sheet: Optional[EvidenceSheet],
+    candidate_names: List[str],
+    candidate_kb_text: str,
+    free_read_styles: Optional[List[str]] = None,
 ) -> str:
-    """Agent 7 (OpenAI GPT-4o): final arbitrator — emit the building's STYLE MIXTURE.
+    """Agent 7 (GPT-4o): arbiter — final mixture grounded in evidence + KB.
 
-    Receives all four evidence streams plus Agent 5/6 outputs and the full
-    image (attached separately by the caller). Uses Step 1 / Step 2 / Step 3
-    CoT structure before emitting a JSON block containing a probability
-    mixture, a composition explanation and per-style evidence bullets.
-
-    Args:
-        agent5: Primary advocate output (now carries ``style_distribution``).
-        agent6: Alternative hypothesist output (single-label adversary).
-        vote_table: Aggregated component votes.
-        material: Building-level material classification.
-        style_prior: Optional CNN style prior from the ResNet50 head.
-        attribute_affinity: Optional cosine affinity vs STYLE_ATTRIBUTE_PROFILES.
-        attributes: Optional AttributeVector for the verbose attribute block.
-
-    Returns:
-        Prompt that forces CoT reasoning followed by a fenced JSON block.
+    Receives the evidence sheet, KB candidate descriptions, the THREE
+    independent panel verdicts, their inter-judge agreement score, AND the full
+    building image (attached separately by the caller). Uses CoT before emitting
+    a fenced JSON block with the final mixture, a composition explanation, and
+    per-style evidence bullets. The arbiter is CONSTRAINED to the candidate
+    names and to the visible evidence — it must not invent a style absent from
+    both.
     """
-    vote_str = _format_score_dict(vote_table)
-    stream2 = _format_material_stream(material, material_available)
-    stream3 = (
-        "EVIDENCE STREAM 3 — CNN global style prior P(style|image) from ResNet50:\n"
-        f"{_format_score_dict(style_prior)}\n\n"
-        if style_prior is not None
-        else ""
-    )
-    stream4 = (
-        "EVIDENCE STREAM 4 — Attribute-profile affinity — TIE-BREAKER ONLY "
-        "(hand-crafted prototypes, LOW discriminative power):\n"
-        f"{_format_score_dict(attribute_affinity)}\n"
-        "  Use ONLY to break a near-tie between styles already ranked close by "
-        "the component votes + CNN prior. Do NOT let it override them.\n\n"
-        if attribute_affinity is not None
-        else ""
-    )
-    cross_check_block = (
-        f"⚠ CROSS-STREAM CHECK: {cross_check_note}\n\n"
-        if cross_check_note
-        else ""
-    )
-    material_step = (
-        "Step 2.6: Verify material consistency — does the dominant material "
-        f"'{material.dominant}' match the styles you intend to give the most "
-        "probability mass?\n"
-        if material_available
-        else ""
-    )
-    attribute_block = (
-        f"{_format_attributes_verbose(attributes)}\n\n"
-        if attributes is not None
-        else ""
-    )
-    anchor_block = _format_fused_anchor(fused_prior)
-
-    # Agent 5 may carry a mixture distribution; show it when available.
-    if agent5.style_distribution is not None:
-        agent5_block = (
-            f"Primary advocate (Analyst A — Agent 5) mixture:\n"
-            f"{_format_score_dict(agent5.style_distribution.distribution)}\n"
-            f"  Composition narrative: "
-            f"{agent5.composition_narrative or agent5.reasoning}\n\n"
+    candidates_block = _format_candidates(candidate_kb_text, candidate_names)
+    names_csv = ", ".join(candidate_names) if candidate_names else "(none)"
+    panel_block = _format_panel_verdicts(panel_verdicts)
+    if panel_agreement is None:
+        agreement_line = (
+            "Inter-judge agreement: undefined (too few valid judges) — be "
+            "cautious and lean on the evidence and the image.\n\n"
         )
     else:
-        agent5_block = (
-            f"Primary advocate (Analyst A — Agent 5): style='{agent5.style}', "
-            f"confidence={agent5.confidence:.2f}\n"
-            f"  Reasoning: {agent5.reasoning}\n\n"
+        agreement_line = (
+            f"Inter-judge agreement (mean pairwise rank correlation): "
+            f"{panel_agreement:.2f} — high (→1.0) means the judges concur so you "
+            "can be decisive; low or negative means they disagree, so weigh the "
+            "evidence and image carefully and spread mass if genuinely "
+            "ambiguous.\n\n"
         )
 
     return (
-        "You are the final arbitrator for a MULTI-STYLE architectural analysis "
-        "system. Buildings often blend influences from multiple periods — your "
-        "task is to output a probability MIXTURE over styles, not a single label.\n\n"
+        "You are the final ARBITER of an open-vocabulary, MULTI-STYLE "
+        "architectural analysis. Buildings often blend influences — output a "
+        "probability MIXTURE over styles, not a single label.\n\n"
         "You are ALSO shown the full building image (attached). Use it to verify "
-        "the overall proportions, facade composition, ornament density, and "
-        "massing — context that per-component crops cannot capture.\n\n"
-        f"EVIDENCE STREAM 1 — Aggregated component vote table (normalised):\n{vote_str}\n\n"
-        f"{stream2}"
-        f"{stream3}{stream4}{attribute_block}"
-        f"{anchor_block}"
-        f"{cross_check_block}"
-        f"{agent5_block}"
-        f"Alternative hypothesist (Analyst B — Agent 6): style='{agent6.style}', "
-        f"confidence={agent6.confidence:.2f}\n"
-        f"  Reasoning: {agent6.reasoning}\n\n"
-        f"{_CONFUSABLE_GUIDANCE}"
-        "Perform the following steps BEFORE giving your final answer:\n"
-        "Step 1: Evaluate each evidence stream objectively. Note where they "
-        "converge and where they conflict.\n"
-        "Step 2: Assess Analyst A's mixture proposal against Analyst B's "
-        "alternative.\n"
+        "overall proportions, facade composition, ornament density, and massing — "
+        "context the structured evidence may miss.\n\n"
+        f"{_format_evidence_sheet(evidence_sheet)}\n"
+        "CANDIDATE STYLES (knowledge base — your verdict MUST use these names):\n"
+        f"{candidates_block}\n\n"
+        f"{_PROPOSED_CANDIDATE_NOTE if 'PROPOSED' in candidates_block else ''}"
+        "PANEL OF INDEPENDENT JUDGES (each scored the evidence separately):\n"
+        f"{panel_block}\n\n"
+        f"{agreement_line}"
+        f"{_format_free_read(free_read_styles)}"
+        "Reason through these steps BEFORE answering:\n"
+        "Step 1: Weigh the evidence-sheet observations. Note where they converge "
+        "and conflict.\n"
+        "Step 2: Compare the panel's verdicts — where do the judges agree, and "
+        "where do they diverge? Treat a style only one judge favours with caution.\n"
         "Step 2.5: Verify against the full image — does the overall composition "
-        "match the proposed mixture? Are there visible cues that none of the "
-        "analysts captured?\n"
-        f"{material_step}"
-        "Step 3: For EACH style that will appear in your final mixture, "
-        "identify 2–4 concrete pieces of evidence that justify its inclusion.\n\n"
-        "After completing Steps 1–3, output your final verdict as a fenced JSON "
-        "block:\n"
+        "match? Any decisive cue the judges missed? Separate the building's MAIN "
+        "MASS/BODY (dominant volume, overall facade, plan) from ACCENT features "
+        "(an isolated roofline, tower, or ornament). Weigh each style by how much "
+        "of the building it GOVERNS: the style of the main body is usually the "
+        "primary, and a striking-but-localised accent is secondary — do not let "
+        "one eye-catching detail outweigh the body it sits on.\n"
+        "Step 2.6: If NO single style governs the building — two or more styles "
+        "share the main mass roughly equally, or distinct parts belong to "
+        "distinct styles — this is a HYBRID / ECLECTIC building. Say so EXPLICITLY "
+        "in composition_explanation (name it a hybrid of the styles), give a "
+        "balanced mixture rather than forcing one winner, and still justify each "
+        "style with its own evidence. A hybrid is a valid, confident answer.\n"
+        "Step 3: For EACH style in your final mixture, write 2–4 evidence bullets "
+        "as COMPLETE, SELF-EXPLANATORY sentences for a non-expert. Each bullet must "
+        "cite the SPECIFIC evidence-sheet observation (dimension + feature) it "
+        "relies on and say what it implies. For a secondary style, also state why "
+        "it is only a minor influence.\n\n"
+        "Constraints:\n"
+        f"- Prefer the candidate style names: {names_csv}\n"
+        "- If the IMAGE clearly shows a well-known architectural style that is NOT "
+        "in the candidate list, you MAY name it using its common English name — it "
+        "will be validated against the knowledge base, and an unknown name is "
+        "dropped. Use this only when the image evidence is strong.\n"
+        "- Include 1 to 4 styles; probabilities sum to ~1.0\n"
+        "- Do NOT fabricate a style unsupported by the image or the evidence sheet\n\n"
+        "After the steps, output your verdict as a fenced JSON block:\n"
         "```json\n"
         "{\n"
-        '  "style_distribution": {"Gothic": 0.55, "Renaissance": 0.28, '
-        '"Baroque": 0.17},\n'
-        '  "composition_explanation": "Dominant X with Y influence because…",\n'
+        '  "style_distribution": {"Gothic": 0.78, "Romanesque": 0.22},\n'
+        '  "composition_explanation": "Dominant Gothic with a Romanesque undertone because…",\n'
         '  "evidence_per_style": {\n'
-        '    "Gothic": ["pointed arch + spire detected", "vertical_dominance=0.82"],\n'
-        '    "Renaissance": ["dome with pediment", "symmetric facade"]\n'
+        '    "Gothic": ["The pointed (lancet) arches recorded in the arch dimension '
+        'and the flying buttresses give the vertical, skeletal structure that '
+        'defines Gothic.", "The large rose window reinforces the Gothic reading."],\n'
+        '    "Romanesque": ["A few round-arched openings at the base hint at an '
+        'earlier Romanesque layer, but they are limited, so it stays secondary."]\n'
         "  }\n"
         "}\n"
         "```\n"
-        "Rules for the mixture:\n"
-        "- Include 1 to 4 styles (omit those that are implausible)\n"
-        "- Probabilities must sum to ~1.0\n"
-        "- Every style in ``style_distribution`` MUST have a matching entry in "
-        "``evidence_per_style`` with at least 2 bullets"
+        "Every style in ``style_distribution`` MUST have a matching "
+        "``evidence_per_style`` entry with at least 2 full-sentence bullets "
+        "(a thin secondary style may have 1)."
+    )
+
+
+def build_free_read_prompt() -> str:
+    """Free read: name the building's style directly from the image.
+
+    Deliberately UNCONSTRAINED — no candidate list, no evidence sheet — so the
+    model answers the way a base vision model does (the reads that score ~78.5%
+    on the benchmark). It is told to give the canonical first-glance style and
+    NOT to over-refine into a fine sub-period/Revival unless clearly warranted,
+    which both mirrors how a base model answers and avoids the system's tendency
+    to drift to a Revival twin. The output seeds the candidate set and is shown
+    to the arbiter as an independent, decorrelated opinion. The image is attached
+    by the caller.
+    """
+    return (
+        "You are an expert architectural historian. Look at the attached building "
+        "photograph and name its architectural style DIRECTLY, as you would at an "
+        "expert first glance.\n"
+        "- Give the SINGLE most likely overall style first, then up to two "
+        "alternates, most likely first.\n"
+        "- Use the common English style name (e.g. Byzantine, Mughal, Gothic, "
+        "Art Deco, Romanesque).\n"
+        "- Judge the MAIN building/body, not an isolated decorative detail.\n"
+        "- Do NOT over-refine into a narrow sub-period or a 'Revival' variant "
+        "unless the image clearly demands it — prefer the canonical style name.\n\n"
+        "Return ONLY a JSON object:\n"
+        '{"styles": ["Most likely style", "Alternate 1", "Alternate 2"]}'
+    )
+
+
+def _format_runoff_features(entry: StyleEntry) -> str:
+    """Render one finalist's KB signature as a short discriminating checklist."""
+    feats = entry.defining_features or list(entry.expected_profile.values())
+    if not feats:
+        return f"- {entry.name}: (no distinctive features recorded)"
+    bullets = "\n".join(f"    • {f}" for f in feats)
+    region = ", ".join(entry.region)
+    head = f"- {entry.name}"
+    if region or entry.period:
+        head += f" ({', '.join(p for p in [region, entry.period] if p)})"
+    return f"{head} — signature features:\n{bullets}"
+
+
+def build_runoff_prompt(
+    entry_a: StyleEntry,
+    entry_b: StyleEntry,
+    evidence_sheet: Optional[EvidenceSheet],
+) -> str:
+    """Contrastive run-off: decide between the two finalists by their signatures.
+
+    Used when the pipeline's final top-2 styles are close (the decision engine is
+    torn). Instead of re-scoring the whole candidate set, this forces a FOCUSED
+    comparison: each finalist's KB ``defining_features`` are laid out as a
+    discriminating checklist, and the model — which is shown the building image —
+    must report which finalist's signature features are actually PRESENT, then
+    split the probability between exactly the two. The KB features act as a
+    contrastive discriminator, not just a description.
+
+    Args:
+        entry_a: First finalist (the current top-1).
+        entry_b: Second finalist (the current runner-up).
+        evidence_sheet: The structured evidence sheet (reasoning aid).
+
+    Returns:
+        A prompt string; the building image is attached separately by the caller.
+    """
+    return (
+        "You are an expert architectural historian making a FINAL, FOCUSED "
+        f"decision between exactly TWO candidate styles for the building shown in "
+        "the attached image. Both were plausible; decide which one the image "
+        "ACTUALLY supports by checking each style's signature features.\n\n"
+        "THE TWO FINALISTS and their distinctive (discriminating) features:\n"
+        f"{_format_runoff_features(entry_a)}\n"
+        f"{_format_runoff_features(entry_b)}\n\n"
+        f"{_format_evidence_sheet(evidence_sheet)}\n"
+        "Look at the IMAGE directly. For EACH finalist, judge how many of its "
+        "signature features are genuinely present on the main building (not a "
+        "single incidental detail). The style whose signature features are more "
+        "fully and centrally present should receive the larger share. If the "
+        "image is truly ambiguous between them, split closer to 50/50.\n\n"
+        "Respond with ONLY a JSON object giving a probability over the two names "
+        "(summing to 1.0), plus which discriminating features you actually saw:\n"
+        "```json\n"
+        "{\n"
+        f'  "style_distribution": {{"{entry_a.name}": 0.7, "{entry_b.name}": 0.3}},\n'
+        f'  "present": {{"{entry_a.name}": ["feature you saw", "..."], '
+        f'"{entry_b.name}": []}},\n'
+        '  "reasoning": "one sentence on the decisive difference"\n'
+        "}\n"
+        "```"
     )
 
 
@@ -592,13 +455,15 @@ def build_translation_prompt(payload: Dict[str, Any]) -> str:
 
     Args:
         payload: Dict with keys ``explanation`` (str), ``key_evidence``
-            (List[str]), ``composition_explanation`` (str), and
-            ``evidence_per_style`` (Dict[str, List[str]]).
+            (List[str]), ``composition_explanation`` (str),
+            ``evidence_per_style`` (Dict[str, List[str]]), and optionally
+            ``evidence_items`` (List[{"i": int, "feature": str, "note": str}])
+            — the 12-dimension evidence sheet rows to translate.
 
     Returns:
         A prompt instructing the model to return a JSON object with the same
         keys whose textual values are translated to natural Vietnamese, while
-        the 10 architectural style names (dict keys) are kept unchanged.
+        the architectural style names (dict keys) are kept unchanged.
     """
     source = json.dumps(payload, ensure_ascii=False, indent=2)
     return (
@@ -607,12 +472,131 @@ def build_translation_prompt(payload: Dict[str, Any]) -> str:
         "fluent Vietnamese. Follow these rules strictly:\n"
         "- Keep the JSON structure and all keys EXACTLY the same.\n"
         "- Do NOT translate architectural style names (e.g. Gothic, Baroque, "
-        "Renaissance, Neoclassical, Art Nouveau, Art Deco, Modernism, "
-        "Deconstructivism, Brutalism, High-tech) - keep them in English, "
-        "including when they appear as keys of evidence_per_style.\n"
-        "- Keep technical attribute tokens (e.g. vertical_dominance=0.82) as-is.\n"
+        "Mughal, Byzantine…) — keep them in English, including when they appear "
+        "as keys of evidence_per_style.\n"
+        "- For evidence_items, translate ONLY the 'feature' and 'note' strings; "
+        "keep each 'i' (index) unchanged and the list order identical.\n"
+        "- Keep technical tokens as-is.\n"
         "- Translate the human-readable sentences and bullet phrases only.\n\n"
         f"Source JSON:\n{source}\n\n"
-        "Return ONLY a fenced JSON block with the translated values:\n"
-        "```json\n{ ... }\n```"
+        "Return ONLY a single JSON object with the translated values (no prose, "
+        "no markdown fences)."
+    )
+
+
+def _format_analysis_context(analysis: Dict[str, Any]) -> str:
+    """Render a stored analysis result (dict) as a grounding context block.
+
+    Pulls the fields useful for answering follow-up questions: the verdict,
+    confidence, mixture distribution, key evidence, composition narrative, the
+    12-dimension evidence sheet, the judge-panel primaries, and the KB-grounded
+    candidate names. English fields are used (the question/answer language is
+    handled separately).
+    """
+    lines: List[str] = []
+    lines.append(f"FINAL VERDICT: {analysis.get('style', '—')} "
+                 f"(confidence {float(analysis.get('confidence') or 0.0):.2f})")
+
+    dist = (analysis.get("style_distribution") or {}).get("distribution") or {}
+    if dist:
+        ranked = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+        lines.append("STYLE MIXTURE: " + ", ".join(
+            f"{s} {round(p * 100)}%" for s, p in ranked if p > 0))
+
+    if analysis.get("explanation"):
+        lines.append(f"EXPLANATION: {analysis['explanation']}")
+    if analysis.get("composition_explanation"):
+        lines.append(f"COMPOSITION: {analysis['composition_explanation']}")
+
+    key_ev = analysis.get("key_evidence") or []
+    if key_ev:
+        lines.append("KEY EVIDENCE:")
+        lines.extend(f"  - {e}" for e in key_ev)
+
+    items = (analysis.get("evidence_sheet") or {}).get("items") or []
+    if items:
+        lines.append("EVIDENCE SHEET (per-dimension observations):")
+        for it in items:
+            styles = ", ".join(it.get("suggested_styles") or []) or "—"
+            line = f"  - [{it.get('dimension')}] {it.get('feature')} -> {styles}"
+            if it.get("note"):
+                line += f" ({it['note']})"
+            lines.append(line)
+
+    verdicts = analysis.get("panel_verdicts") or []
+    primaries = [
+        f"{v.get('judge')}: {(v.get('style_distribution') or {}).get('primary')}"
+        for v in verdicts
+        if not v.get("failed") and (v.get("style_distribution") or {}).get("primary")
+    ]
+    if primaries:
+        lines.append("JUDGE PANEL PRIMARIES: " + "; ".join(primaries))
+    if analysis.get("panel_agreement") is not None:
+        lines.append(f"PANEL AGREEMENT: {analysis['panel_agreement']}")
+
+    cand = analysis.get("candidate_names") or []
+    if cand:
+        lines.append("KB CANDIDATE STYLES CONSIDERED: " + ", ".join(cand))
+
+    return "\n".join(lines)
+
+
+def build_qa_prompt(
+    analysis: Dict[str, Any],
+    kb_text: str,
+    question: str,
+    history: List[Dict[str, str]],
+    lang: str,
+) -> str:
+    """Build a grounded Q&A prompt about one specific analysis result.
+
+    The model answers in "gated" mode (decision confirmed with the user):
+    questions about THIS image are answered strictly from the analysis context;
+    general architecture-knowledge questions may be answered but must be flagged
+    as reference knowledge; off-topic questions are politely declined.
+
+    Args:
+        analysis: The stored analysis result (AnalyzeResponse-shaped dict).
+        kb_text: Rendered KB descriptions for the candidate styles (may be empty).
+        question: The user's current question.
+        history: Prior conversation turns as ``{"role", "content"}`` dicts.
+        lang: ``"vi"`` or ``"en"`` — the language the answer must be written in.
+
+    Returns:
+        A single prompt string for a text LLM.
+    """
+    answer_lang = "Vietnamese" if lang == "vi" else "English"
+    context = _format_analysis_context(analysis)
+    kb_block = kb_text.strip() or "(no KB descriptions available)"
+
+    convo = ""
+    if history:
+        turns = []
+        for turn in history:
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            turns.append(f"{role}: {turn.get('content', '')}")
+        convo = "CONVERSATION SO FAR:\n" + "\n".join(turns) + "\n\n"
+
+    return (
+        "You are an architecture assistant helping a user understand ONE specific "
+        "image-analysis result produced by this system. You are given the full "
+        "analysis context and knowledge-base descriptions of the candidate styles.\n\n"
+        "ANSWERING RULES (follow strictly):\n"
+        "1. If the question is about THIS image / its result, answer ONLY from the "
+        "ANALYSIS CONTEXT and KB DESCRIPTIONS below. Cite the concrete evidence "
+        "(dimensions, features, judge votes, percentages). Never invent evidence, "
+        "numbers, or features that are not present.\n"
+        "2. If the question is about GENERAL architecture knowledge (not derivable "
+        "from this analysis), you may answer briefly, but you MUST prefix that part "
+        "with a clear note that it is reference knowledge, not drawn from this "
+        "image's analysis.\n"
+        "3. If the question is unrelated to architecture, politely decline and "
+        "steer the user back to this analysis.\n"
+        f"4. Write the entire answer in {answer_lang}. Keep architectural style "
+        "names in English. Be concise and concrete.\n\n"
+        f"ANALYSIS CONTEXT:\n{context}\n\n"
+        f"KB DESCRIPTIONS (candidate styles):\n{kb_block}\n\n"
+        f"{convo}"
+        f"USER QUESTION: {question}\n\n"
+        "Answer:"
     )

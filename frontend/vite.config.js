@@ -10,6 +10,11 @@ export default defineConfig({
       '/analyze': 'http://localhost:8000',
       '/admin': 'http://localhost:8000',
       '/upload': 'http://localhost:8000',
+      // Public CMS content for the live (non-admin) pages.
+      '/content': 'http://localhost:8000',
+      // Proxy all billing API calls to the backend EXCEPT /billing/result,
+      // which is a frontend SPA route (the post-payment result page).
+      '^/billing(?!/result)': 'http://localhost:8000',
     },
   },
 });

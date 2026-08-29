@@ -113,6 +113,114 @@ async def ensure_roles_seeded() -> None:
         await session.commit()
 
 
+async def ensure_agents_seeded() -> None:
+    """Insert the open-vocabulary pipeline agents and prune legacy ones.
+
+    Idempotent: matches on ``AgentName`` and only inserts the missing rows.
+    Agent names must match the telemetry labels emitted by the pipeline
+    (``Agent A``, ``Panel: …``, ``Arbiter``) so AgentRuns can be attributed.
+
+    Descriptions are ASCII-only on purpose: ``Agents.Description`` is a non-
+    Unicode SQL Server column, so Vietnamese diacritics would be stored as
+    ``?``. The admin UI renders rich Vietnamese labels from a frontend map keyed
+    by the (ASCII-safe) agent name instead.
+
+    Legacy ``Agent 1`` … ``Agent 7`` rows from the retired closed-set pipeline
+    are deleted so the admin roster shows only the 5 agents actually in use.
+    """
+    from app.models.orm_models import Agent  # local import avoids circular dependency
+    from chatbot.services import provider_credentials
+
+    g = provider_credentials.get_credentials("gemini").model
+    o = provider_credentials.get_credentials("openai").model
+    gr = provider_credentials.get_credentials("xai").model
+    seed = {
+        "Agent A": f"12-dimension evidence extraction from image (vision) - Gemini {g}",
+        "Panel: Gemini": f"Independent style-mixture judge (vision) - Gemini {g}",
+        "Panel: OpenAI": f"Independent style-mixture judge (vision) - OpenAI {o}",
+        "Panel: Grok": f"Independent style-mixture judge (vision) - Grok {gr}",
+        "Arbiter": f"Final arbiter, reconciles 3 verdicts + image via CoT - OpenAI {o}",
+    }
+    # Legacy closed-set agents + the retired DeepSeek judge (DeepSeek now only
+    # translates, emitting no AgentRuns) are pruned so the roster shows the five
+    # agents actually attributed in telemetry.
+    legacy_names = [f"Agent {i}" for i in range(1, 8)] + ["Panel: DeepSeek"]
+
+    # Seed the 5 active agents first and commit on its own, so legacy cleanup
+    # (which may be blocked by AgentRuns FK references) can never prevent it.
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Agent))
+        existing = {row.AgentName for row in result.scalars().all()}
+        for name, description in seed.items():
+            if name not in existing:
+                session.add(Agent(AgentName=name, Description=description))
+        await session.commit()
+
+    # Best-effort: prune legacy closed-set agents in a separate transaction.
+    # If AgentRuns still reference them the delete fails — that is fine, the
+    # admin UI hides any agent not in the active set regardless.
+    async with AsyncSessionLocal() as session:
+        try:
+            legacy = await session.execute(
+                select(Agent).where(Agent.AgentName.in_(legacy_names))
+            )
+            rows = legacy.scalars().all()
+            for row in rows:
+                await session.delete(row)
+            await session.commit()
+        except Exception as exc:
+            logger.warning("Could not prune legacy agents (referenced by AgentRuns?): %s", exc)
+            await session.rollback()
+
+
+async def ensure_plans_seeded() -> None:
+    """Insert the default billing plans if they do not yet exist.
+
+    Idempotent: matches on ``PlanCode`` and only inserts the missing rows, so an
+    admin's later price/token edits are never overwritten. Tier benefits (e.g. a
+    lower per-analysis cost) live in ``BenefitsJson``.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    from app.models.orm_models import Plan  # local import avoids circular dependency
+
+    now = datetime.now(timezone.utc)
+    # (code, name, type, price_vnd, tokens, duration_days, benefits, sort)
+    catalog = [
+        ("free", "Free", "subscription", 0, 0, None, None, 0),
+        ("pro", "Pro", "subscription", 99_000, 500, 30, {"cost_per_analysis": 2}, 10),
+        ("premium", "Premium", "subscription", 199_000, 1500, 30,
+         {"cost_per_analysis": 1}, 20),
+        ("pack_100", "100 Tokens", "token_pack", 20_000, 100, None, None, 100),
+        ("pack_500", "500 Tokens", "token_pack", 90_000, 500, None, None, 110),
+        ("pack_1000", "1000 Tokens", "token_pack", 160_000, 1000, None, None, 120),
+    ]
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(Plan.PlanCode))
+        existing = {row[0] for row in result.all()}
+        for code, name, ptype, price, tokens, duration, benefits, order in catalog:
+            if code in existing:
+                continue
+            session.add(
+                Plan(
+                    PlanCode=code,
+                    PlanName=name,
+                    PlanType=ptype,
+                    PriceAmount=price,
+                    Currency="VND",
+                    TokenAmount=tokens,
+                    DurationDays=duration,
+                    BenefitsJson=json.dumps(benefits) if benefits else None,
+                    SortOrder=order,
+                    IsActive=True,
+                    CreatedAt=now,
+                )
+            )
+        await session.commit()
+
+
 async def check_db_connection() -> bool:
     """Emit a lightweight ping to verify the database is reachable.
 

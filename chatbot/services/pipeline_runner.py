@@ -1,270 +1,308 @@
-"""7-agent architecture analysis pipeline.
+"""Open-vocabulary analysis pipeline (Tier 2 of the new architecture).
 
-Architecture:
-    Tier 1 (asyncio.gather — parallel per component):
-        Agent 1 (Gemini vision)   → geometric feature description
-        Agent 2 (Gemini ×3 MC)    → style probability distribution
-        Agent 3a (rule check)     → hard rule contradiction detection
-        Agent 3b (DeepSeek)       → contradiction interpretation (if needed)
-        Agent 4 (DeepSeek)        → per-component style conclusion
+The orchestrator runs Stage A (Agent A evidence extraction) and Stage B (KB
+grounding) before calling this runner, which performs the judging:
 
-    compute_aggregated_votes()    → weighted sum (pure code)
+    Stage C  Panel of 3 independent judges (Gemini / DeepSeek / OpenAI) — each
+             scores the KB candidates into a mixture from the SAME evidence sheet
+    Stage D  Inter-judge agreement = mean pairwise Spearman of their rankings
+    Stage E  Arbiter (OpenAI GPT-4o + full image) → final mixture, grounded in
+             evidence + KB + the panel's verdicts
+    Stage F  Abstention — low inter-judge agreement (PRIMARY signal) ‖ low
+             margin / high entropy (secondary) ⇒ mark uncertain + return top-K
 
-    Tier 2 (sequential):
-        Agent 5 (DeepSeek)        → primary advocate
-        Agent 6 (DeepSeek)        → alternative hypothesist (label only)
-        Agent 7 (OpenAI GPT-4o)   → final arbitrator with CoT
+The runner takes a :class:`PipelineInput` (evidence sheet + candidate names +
+candidate KB text + full image) and returns a :class:`FinalAnalysisResult`.
+LLM self-reported confidence is NOT trusted: uncertainty comes from inter-judge
+agreement (decisions #71, #73, #75).
 """
 import asyncio
+import contextvars
 import json
 import logging
 import math
-from typing import Dict, List
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 from app.config import settings
+from app.services import kb_suggestion_store
 from chatbot.services.deepseek_service import DeepSeekService
 from chatbot.services.gemini_service import GeminiService
+from chatbot.services.grok_service import GrokService
 from chatbot.services.openai_service import OpenAIService
+from chatbot.services.style_kb_service import StyleKbService
+from chatbot.services.style_panel import StylePanel
+from chatbot.utils.circuit_breaker import get_circuit_breaker
+from chatbot.utils.consensus import panel_agreement, weighted_mean_distribution
+from chatbot.utils.distribution import build_style_distribution_safe, safe_float
+from chatbot.utils.json_utils import parse_json_safe
 from chatbot.utils.prompt_builder import (
-    build_agent1_prompt,
-    build_agent2_prompt,
-    build_agent3b_prompt,
-    build_agent4_prompt,
-    build_agent5_prompt,
-    build_agent6_prompt,
     build_agent7_prompt,
+    build_runoff_prompt,
     build_translation_prompt,
 )
-from chatbot.services.fuser_service import FuserService
-from chatbot.utils.fusion import numeric_fuse
-from chatbot.utils.rule_checker import (
-    check_material_consistency,
-    check_prior_vote_agreement,
-    check_rules,
-    compute_attribute_affinity,
-)
 from chatbot.utils.schemas import (
-    Agent1Output,
-    Agent2Output,
-    Agent3Output,
-    Agent4Output,
-    Agent5Output,
-    Agent6Output,
-    AttributeVector,
-    ComponentAnalysis,
-    DetectedComponent,
+    AgentRunRecord,
+    EvidenceItem,
+    EvidenceSheet,
     FinalAnalysisResult,
-    MaterialDistribution,
+    PanelVerdict,
     PipelineInput,
-    STYLE_CLASSES,
     StyleCandidate,
     StyleDistribution,
+    StyleEntry,
 )
-from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_AGENT2_TEMPERATURES = [0.5, 0.7, 0.9]
 _TIMEOUT = settings.PIPELINE_AGENT_TIMEOUT_SEC
-_SECONDARY_THRESHOLD = 0.15
-"""Minimum normalised probability for a style to enter ``StyleDistribution.secondary``."""
+# Max evidence rows translated per LLM call (keeps JSON output under the cap).
+_EVIDENCE_TRANSLATE_BATCH = 6
+_ARBITER_AGENT = "Arbiter"
+_RUNOFF_AGENT = "Run-off"
+
+_T = TypeVar("_T")
+
+# Per-analysis telemetry sink. Set at the start of ``run()`` to a fresh list;
+# the ContextVar value is shared by reference so agent calls record into the
+# same per-request list without threading it through every signature.
+_telemetry_var: contextvars.ContextVar[Optional[List[AgentRunRecord]]] = (
+    contextvars.ContextVar("agent_telemetry", default=None)
+)
+
+
+_RAW_TRUNCATE = 8000  # cap stored raw/parsed strings to keep AgentRuns rows small
+
+# Large enough to capture every KB entry with positive feature support when the
+# escape hatch checks an out-of-candidate style against the observed evidence.
+_ESCAPE_FEATURE_TOP_N = 1000
+
+
+def _record_run(
+    agent_name: str,
+    model_id: str,
+    latency_ms: float,
+    success: bool,
+    raw: Optional[str] = None,
+    parsed: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Append one agent-run record to the active telemetry sink, if any.
+
+    ``raw``/``parsed`` are the LLM's raw response and the parsed JSON (truncated)
+    and ``error`` the failure message — persisted so a run can be audited (the
+    AgentRuns rows were all-NULL in the 503 debug).
+    """
+    sink = _telemetry_var.get()
+    if sink is not None:
+        sink.append(
+            AgentRunRecord(
+                agent_name=agent_name,
+                model_id=model_id,
+                latency_ms=int(latency_ms),
+                parse_success=success,
+                raw_output=raw[:_RAW_TRUNCATE] if raw else None,
+                parsed_output=parsed[:_RAW_TRUNCATE] if parsed else None,
+                error=error[:_RAW_TRUNCATE] if error else None,
+            )
+        )
 
 
 class PipelineRunner:
-    """Orchestrates the 7-agent analysis pipeline for a list of components.
+    """Run the open-vocabulary judging panel + arbiter.
 
-    Receives the three LLM services via constructor injection so they can be
-    swapped or mocked in tests without touching this class.
+    Receives the judging panel and the arbiter LLM via constructor injection so
+    they can be swapped or mocked in tests without touching this class.
     """
 
     def __init__(
         self,
-        vision_llm: GeminiService,
+        panel: StylePanel,
+        arbiter_llm: OpenAIService,
         text_llm: DeepSeekService,
-        final_llm: OpenAIService,
-        fuser: Optional[FuserService] = None,
+        kb: Optional[StyleKbService] = None,
+        gemini_llm: Optional[GeminiService] = None,
+        grok_llm: Optional[GrokService] = None,
     ) -> None:
-        """Store injected LLM services + optional learned fuser.
+        """Store the injected panel, arbiter, translator, KB, and arbiter backups.
 
         Args:
-            vision_llm: GeminiService for Agent 1 and Agent 2.
-            text_llm: DeepSeekService for Agents 3b, 4, 5, 6.
-            final_llm: OpenAIService for Agent 7.
-            fuser: Optional learned FuserService. When provided (and global
-                features are present) it produces the numeric prior anchor /
-                fallback instead of the hand-weighted ``numeric_fuse``.
+            panel: StylePanel running the three independent judges (Stage C).
+            arbiter_llm: OpenAIService for the arbiter (Stage E, vision-capable).
+            text_llm: DeepSeekService used for the bilingual translation pass
+                (DeepSeek's JSON mode is reliable; routing translation through
+                the arbiter's JSON mode returned empty responses).
+            kb: StyleKbService used for the recall escape hatch — matching an
+                arbiter-proposed style that is outside the candidate set back to
+                an existing KB entry (lifts the candidate ceiling without
+                polluting the KB). When None the escape hatch is disabled.
+            gemini_llm: Optional Gemini vision service used ONLY as an arbiter
+                fallback (A4b) when the primary OpenAI arbiter has a long outage.
+            grok_llm: Optional Grok vision service, the second arbiter fallback.
+                Neither replaces a panel judge — the panel stays three
+                independent providers.
         """
-        self._vision = vision_llm
+        self._panel = panel
+        self._arbiter_llm = arbiter_llm
         self._text = text_llm
-        self._final = final_llm
-        self._fuser = fuser
+        self._kb = kb
+        self._gemini = gemini_llm
+        self._grok = grok_llm
 
     async def run(self, pipeline_input: PipelineInput) -> FinalAnalysisResult:
-        """Run the full 7-agent pipeline with both component and material inputs.
+        """Run the panel → consensus → arbiter → abstention flow.
 
         Args:
-            pipeline_input: Combined output of YOLOv8s-detection (components)
-                and YOLOv8s-cls (material classification).
+            pipeline_input: Evidence sheet + candidate names/KB text + full image.
 
         Returns:
-            FinalAnalysisResult with style, confidence, explanation, evidence.
-
-        Raises:
-            asyncio.TimeoutError: If any agent exceeds PIPELINE_AGENT_TIMEOUT_SEC.
+            FinalAnalysisResult with the open-vocabulary style mixture, narrative,
+            the panel verdicts + agreement, abstention flags, and telemetry.
         """
-        import time
         start = time.monotonic()
+        telemetry: List[AgentRunRecord] = []
+        _telemetry_var.set(telemetry)
 
-        components = pipeline_input.components
-        material = pipeline_input.material
-        material_available = pipeline_input.material_available
-        # Global features are Optional during migration — None for legacy callers.
-        global_features = pipeline_input.global_features
-        if global_features is not None:
-            attributes: Optional[AttributeVector] = global_features.attributes
-            style_prior: Optional[Dict[str, float]] = global_features.style_prior
-            attribute_affinity: Optional[Dict[str, float]] = compute_attribute_affinity(
-                attributes
-            )
-            gradcam_b64: Optional[str] = global_features.gradcam_b64
-        else:
-            attributes = None
-            style_prior = None
-            attribute_affinity = None
-            gradcam_b64 = None
+        sheet = pipeline_input.evidence_sheet or EvidenceSheet()
+        candidate_names = pipeline_input.candidate_names
+        kb_text = pipeline_input.candidate_kb_text
+        allowed = set(candidate_names)
+        evidence_votes = _build_evidence_votes(sheet)
+        fallback_primary = _fallback_primary(evidence_votes, candidate_names)
 
-        # Tier 1: parallel per-component analysis.
-        # return_exceptions=True so a single component failure (e.g. Gemini 503
-        # in Agent 1) drops only that component instead of crashing the request.
         warnings: List[str] = []
-        if not components:
-            warnings.append(
-                "No components detected by YOLO; relying on CNN prior + attributes"
-            )
-        raw_results = await asyncio.gather(
-            *[
-                self._run_component(c, material, attributes, material_available)
-                for c in components
-            ],
-            return_exceptions=True,
+        if not candidate_names:
+            warnings.append("No KB candidates matched the proposed styles")
+        if not sheet.items:
+            warnings.append("Evidence sheet was empty (Agent A produced no items)")
+
+        # Stage C — the panel never raises (per-judge errors are captured). Every
+        # judge now SEES THE IMAGE alongside the evidence sheet (decision
+        # 2026-06-19) so each judge ≈ its base vision model.
+        panel_verdicts = await self._panel.judge(
+            sheet, candidate_names, kb_text, evidence_votes, allowed,
+            fallback_primary, full_image_base64=pipeline_input.full_image_base64,
+            on_run=_record_run,
         )
-        tier1_results: List[ComponentAnalysis] = []
-        for component, outcome in zip(components, raw_results):
-            if isinstance(outcome, BaseException):
-                logger.warning(
-                    "Component %s (%s) failed and was dropped: %s",
-                    component.component_id,
-                    component.component_type,
-                    outcome,
-                )
-                continue
-            tier1_results.append(outcome)
-
-        dropped = len(components) - len(tier1_results)
-        if dropped:
-            warnings.append(
-                f"{dropped}/{len(components)} component(s) dropped due to LLM errors"
-            )
-        agent2_degraded = sum(1 for ca in tier1_results if ca.agent2.degraded)
-        if agent2_degraded:
-            warnings.append(
-                f"Agent 2 degraded on {agent2_degraded} component(s) "
-                "(excluded from vote aggregation)"
-            )
-        degraded = bool(warnings)
-
-        # Aggregation (pure code, no LLM). Raw weighted sums feed nothing else;
-        # the prompts receive a NORMALISED copy so magnitudes are interpretable.
-        vote_table = compute_aggregated_votes(tier1_results)
-        votes_norm = _normalize_votes(vote_table)
-
-        # P4 soft cross-check: flag when component votes and the CNN prior
-        # disagree on the leading style (note injected into Agent 7's prompt).
-        cross_check_note = (
-            check_prior_vote_agreement(votes_norm, style_prior)
-            if style_prior is not None
-            else None
-        )
-        if cross_check_note:
-            warnings.append("Low agreement between component votes and CNN prior")
-
-        # Build component summaries for Tier 2 prompts
-        summaries = [
-            f"{ca.component_type} → {ca.agent4.style} ({ca.agent4.confidence:.2f}): "
-            f"{ca.agent4.reasoning[:80]}"
-            for ca in tier1_results
+        valid_dists = [
+            v.style_distribution.distribution
+            for v in panel_verdicts
+            if not v.failed and v.style_distribution is not None
         ]
+        n_failed = len(panel_verdicts) - len(valid_dists)
+        if n_failed:
+            warnings.append(f"{n_failed} of {len(panel_verdicts)} judges failed")
+        # Weight each judge by decisiveness (used for the panel-average fallback).
+        judge_weights = _judge_weights(valid_dists)
 
-        # Numeric fused prior — used BOTH as an anchor in the LLM prompts AND
-        # as the fallback verdict if the LLM fusion (Tier 2) is unavailable
-        # (→ LLM is truly optional). Prefer the learned, calibrated fuser when
-        # available; otherwise the hand-weighted numeric_fuse.
-        fused_prior = self._compute_fused_prior(
-            components=components,
-            material=material,
-            material_available=material_available,
-            attributes=attributes,
-            style_prior=style_prior,
-            votes_norm=votes_norm,
-            attribute_affinity=attribute_affinity,
-        )
-        # Always prefer the whole-image input so Agent 7 keeps visual context
-        # even when YOLO detected 0 components.
-        full_image_b64 = pipeline_input.full_image_base64 or (
-            components[0].full_image_base64 if components else None
-        )
+        # Stage D — inter-judge agreement (None when < 2 valid judges).
+        agreement = panel_agreement(valid_dists, candidate_names)
 
-        # Tier 2: sequential LLM fusion. Wrapped so a hard LLM failure (after
-        # retries) degrades to the numeric fused prior instead of a 500.
+        # Stage E — arbiter; on failure fall back to the panel-average mixture.
         translation: Dict[str, Any] = {}
+        evidence_sheet_vi: Optional[EvidenceSheet] = None
+        degraded = bool(warnings)
         try:
-            agent5 = await self._agent5(
-                votes_norm,
-                summaries,
-                material,
-                style_prior,
-                attribute_affinity,
-                attributes,
-                material_available,
-                fused_prior,
+            final = await self._arbiter(
+                panel_verdicts, agreement, sheet, candidate_names, kb_text,
+                pipeline_input.full_image_base64, allowed, fallback_primary,
+                pipeline_input.free_read_styles,
             )
-            agent6 = await self._agent6(agent5.style)
-            final = await self._agent7(
-                agent5,
-                agent6,
-                votes_norm,
-                material,
-                full_image_b64,
-                style_prior,
-                attribute_affinity,
-                attributes,
-                material_available,
-                cross_check_note,
-                fused_prior,
+            # W1 — let the panel decide the final mixture (panel / consensus
+            # modes); "arbiter" mode leaves the arbiter's mixture unchanged.
+            final = decide_final_distribution(
+                settings.DECISION_MODE, final, valid_dists, judge_weights,
+                candidate_names, agreement, allowed, fallback_primary,
             )
-            if settings.ENABLE_BILINGUAL:
-                translation = await self._translate_result(
+            # Contrastive run-off — when the final top-2 are close, re-decide
+            # between just those two using their KB signatures (best-effort; never
+            # raises, leaves ``final`` unchanged on any failure).
+            try:
+                final = await self._runoff(
+                    final, sheet, pipeline_input.full_image_base64
+                )
+            except Exception as exc:  # noqa: BLE001 — run-off is best-effort
+                logger.warning("Run-off stage failed; keeping arbiter result: %s", exc)
+            # The arbiter answered, but on a BACKUP provider (A4b) → degraded run.
+            arbiter_provider = final.get("arbiter_provider")
+            if arbiter_provider and arbiter_provider != "openai":
+                degraded = True
+                warnings.append(
+                    f"Arbiter used fallback provider: {arbiter_provider}"
+                )
+            # Translation is OFF the critical path when DEFER_TRANSLATION is set:
+            # run() returns the English result immediately and the Vietnamese is
+            # produced lazily on first re-open (it never feeds the decision, so
+            # deferring is accuracy-neutral). False = translate inline as before.
+            if settings.ENABLE_BILINGUAL and not settings.DEFER_TRANSLATION:
+                translation, evidence_sheet_vi = await self.translate(
                     explanation=final.get("explanation", ""),
                     key_evidence=final.get("key_evidence", []),
                     composition_explanation=final.get("composition_explanation"),
                     evidence_per_style=final.get("evidence_per_style"),
+                    evidence_sheet=sheet,
                 )
-        except Exception as exc:  # boundary: total LLM-fusion outage
-            logger.warning("Tier-2 LLM fusion failed; using numeric fusion: %s", exc)
-            warnings.append("LLM fusion unavailable; numeric fusion used")
+        except Exception as exc:  # boundary: arbiter outage
+            logger.warning("Arbiter failed; using panel-average fallback: %s", exc)
+            warnings.append("Arbiter unavailable; panel-average fallback used")
             degraded = True
-            agent5, agent6, final = _numeric_fallback(fused_prior)
+            final = _panel_fallback(
+                valid_dists, judge_weights, candidate_names, fallback_primary, allowed
+            )
+
+        # Open-set gate — an out-of-KB style may only stay primary if the panel
+        # cleared the HIGHER agreement bar; otherwise demote it to the best in-KB
+        # style. Then record which displayed styles are out-of-KB (for the badge +
+        # the suggestion queue).
+        out_of_kb_names = set(pipeline_input.out_of_kb_names)
+        out_of_kb_styles: List[str] = []
+        if out_of_kb_names:
+            final, demoted = _gate_out_of_kb_primary(
+                final, out_of_kb_names, len(valid_dists), agreement,
+                allowed, fallback_primary,
+            )
+            if demoted:
+                degraded = True
+                warnings.append(
+                    "Out-of-KB candidate below the display bar — demoted to the "
+                    "best in-KB style"
+                )
+            gated_dist: Optional[StyleDistribution] = final.get("style_distribution")
+            if gated_dist is not None:
+                out_of_kb_styles = [
+                    s for s in gated_dist.distribution if s in out_of_kb_names
+                ]
+            if out_of_kb_styles:
+                warnings.append(
+                    "Result includes a style outside the curated KB — pending "
+                    "human review"
+                )
+                kb_suggestion_store.record(out_of_kb_styles)
 
         final_dist: Optional[StyleDistribution] = final.get("style_distribution")
         primary_style = final["style"]
-        primary_conf = float(final["confidence"])
+        # Confidence reflects RUN QUALITY, not just the arbiter's mixture sharpness:
+        # the primary mass is discounted when judges failed, extraction calls were
+        # lost, or the extraction calls disagreed (decision A3 / the 503 debug).
+        run_quality = _run_quality(
+            valid_judges=len(valid_dists),
+            attempted_judges=len(panel_verdicts),
+            extraction_completeness=pipeline_input.extraction_completeness,
+            extraction_agreement=pipeline_input.extraction_agreement,
+        )
+        # ``sharpness`` = the arbiter's raw primary mass (drives the abstention
+        # conf-gate, unchanged); ``primary_conf`` is the REPORTED confidence,
+        # additionally discounted by run quality so a degraded run reads lower.
+        sharpness = float(final["confidence"])
+        primary_conf = round(sharpness * run_quality, 4)
         margin, entropy = (
             _distribution_stats(final_dist.distribution)
             if final_dist is not None
             else (None, None)
         )
 
-        # Abstention: flag low-confidence results and surface top-K candidates.
+        # Stage F — abstention. Inter-judge agreement is the PRIMARY signal;
+        # margin/entropy/conf are secondary. Surface top-K when uncertain.
         uncertain = False
         candidates: List[StyleCandidate] = []
         if final_dist is not None:
@@ -275,31 +313,62 @@ class PipelineRunner:
                 StyleCandidate(style=s, probability=round(p, 4))
                 for s, p in ranked[: settings.UNCERTAINTY_TOP_K]
             ]
+        if len(valid_dists) < 2:
+            uncertain = True  # cannot establish consensus with < 2 judges
+        elif (
+            len(valid_dists) >= 3
+            and agreement is not None
+            and agreement < settings.PANEL_AGREEMENT_MIN
+        ):
+            # Only trust the agreement signal with ≥3 judges; a 2-judge agreement
+            # is a single correlation and was a misleading "0.88" in the 503 run.
+            uncertain = True
+        if final_dist is not None and not uncertain:
             uncertain = (
                 (margin is not None and margin < settings.UNCERTAINTY_MARGIN_MIN)
                 or (entropy is not None and entropy > settings.UNCERTAINTY_ENTROPY_MAX)
                 or (
                     settings.UNCERTAINTY_CONF_MIN > 0
-                    and primary_conf < settings.UNCERTAINTY_CONF_MIN
+                    and sharpness < settings.UNCERTAINTY_CONF_MIN
                 )
             )
         if uncertain:
             warnings.append("Low-confidence result — returning top-K candidates")
 
+        # Hybrid (multi-style) — INDEPENDENT of abstention. True when the final
+        # mixture has ≥ 2 significant styles OR the extraction calls disagreed.
+        # A hybrid is a confident, fully-explained mixture, not a refusal.
+        extraction_agreement = pipeline_input.extraction_agreement
+        hybrid = _is_hybrid(final_dist, extraction_agreement)
+        if hybrid:
+            warnings.append(
+                "Hybrid/eclectic building — multiple coexisting styles "
+                "(see evidence per style)"
+            )
+
+        # Overall run health (A4b) — persisted in DetailJson for auditing.
+        run_status = _run_status(
+            valid_judges=len(valid_dists),
+            attempted_judges=len(panel_verdicts),
+            extraction_completeness=pipeline_input.extraction_completeness,
+            degraded=degraded,
+        )
+
         elapsed_ms = (time.monotonic() - start) * 1000.0
         return FinalAnalysisResult(
             style=primary_style,
             confidence=primary_conf,
+            run_status=run_status,
             explanation=final.get("explanation", ""),
             key_evidence=final.get("key_evidence", []),
-            components=tier1_results,
-            agent5=agent5,
-            agent6=agent6,
+            panel_verdicts=panel_verdicts,
+            panel_agreement=agreement,
             processing_time_ms=round(elapsed_ms, 1),
             style_distribution=final_dist,
             composition_explanation=final.get("composition_explanation"),
             evidence_per_style=final.get("evidence_per_style"),
-            gradcam_b64=gradcam_b64,
+            evidence_sheet=sheet,
+            evidence_sheet_vi=evidence_sheet_vi,
             explanation_vi=translation.get("explanation_vi"),
             key_evidence_vi=translation.get("key_evidence_vi"),
             composition_explanation_vi=translation.get("composition_explanation_vi"),
@@ -310,7 +379,280 @@ class PipelineRunner:
             distribution_entropy=entropy,
             uncertain=uncertain,
             candidates=candidates,
+            hybrid=hybrid,
+            extraction_agreement=extraction_agreement,
+            candidate_names=list(candidate_names),
+            out_of_kb_styles=out_of_kb_styles,
+            agent_runs=telemetry,
         )
+
+    def _expand_allowed_with_kb(
+        self,
+        raw_dist: Dict[str, Any],
+        allowed: set,
+        observed_features: List[str],
+    ) -> tuple[Dict[str, float], set]:
+        """Admit arbiter-proposed styles outside the candidate set via the KB.
+
+        For each style name the arbiter emitted that is NOT already an allowed
+        candidate, try to match it to an existing KB entry. A match is renamed to
+        its canonical KB name and that name is added to ``allowed`` (lifting the
+        candidate ceiling). A name with NO KB match is kept as-is and will be
+        filtered out downstream — the KB is never polluted with invented styles.
+
+        When ``RECALL_ESCAPE_REQUIRE_EVIDENCE`` is on, a KB-matched style is
+        admitted only if the OBSERVED evidence also supports it — its KB
+        defining-features overlap what Agent A described
+        (:meth:`StyleKbService.retrieve_by_features`). This stops the arbiter
+        from naming a real KB style the image shows no sign of. A KB match with
+        no evidence support is left in the mixture unrenamed, so
+        ``build_style_distribution_safe`` drops it like any out-of-set name.
+
+        Disabled (returns the inputs unchanged) when no KB was injected or
+        ``RECALL_ESCAPE_HATCH`` is False.
+        """
+        if self._kb is None or not settings.RECALL_ESCAPE_HATCH:
+            return raw_dist, allowed
+        allowed_lower = {a.lower() for a in allowed}
+        new_allowed = set(allowed)
+        remapped: Dict[str, float] = {}
+        # Evidence-supported KB names (lazy — only computed when a genuine
+        # out-of-candidate name appears and the evidence gate is enabled).
+        supported_names: Optional[set] = None
+        for key, value in raw_dist.items():
+            if not isinstance(key, str) or not key.strip():
+                continue
+            name = key.strip()
+            prob = safe_float(value)
+            if name.lower() in allowed_lower:
+                remapped[name] = remapped.get(name, 0.0) + prob
+                continue
+            entry = self._kb.match(name)
+            if entry is None:
+                remapped[name] = remapped.get(name, 0.0) + prob  # filtered later
+                continue
+            if settings.RECALL_ESCAPE_REQUIRE_EVIDENCE:
+                if supported_names is None:
+                    supported_names = {
+                        e.name
+                        for e in self._kb.retrieve_by_features(
+                            observed_features, _ESCAPE_FEATURE_TOP_N
+                        )
+                    }
+                if entry.name not in supported_names:
+                    # KB-real but the evidence does not back it → do not admit.
+                    remapped[name] = remapped.get(name, 0.0) + prob  # filtered later
+                    continue
+            new_allowed.add(entry.name)
+            allowed_lower.add(entry.name.lower())
+            remapped[entry.name] = remapped.get(entry.name, 0.0) + prob
+        return remapped, new_allowed
+
+    def _arbiter_chain(
+        self, prompt: str, full_image_b64: Optional[str]
+    ) -> List[tuple]:
+        """Ordered (provider_key, model_id, raw-call) arbiter chain.
+
+        OpenAI leads; Gemini then Grok follow as fallbacks (A4b) only when they
+        were injected AND there is an image for them to inspect. All emit CoT
+        prose + a ```json``` block parsed the same way.
+        """
+        chain: List[tuple] = [
+            (
+                "openai",
+                getattr(self._arbiter_llm, "model_name", settings.OPENAI_MODEL),
+                lambda: self._arbiter_llm.chat_structured(
+                    prompt, image_base64=full_image_b64
+                ),
+            )
+        ]
+        if full_image_b64:
+            if self._gemini is not None:
+                chain.append((
+                    "gemini",
+                    getattr(self._gemini, "model_name", settings.GEMINI_MODEL),
+                    lambda: self._gemini.generate_with_image(
+                        prompt, image_base64=full_image_b64, temperature=0.4
+                    ),
+                ))
+            if self._grok is not None:
+                chain.append((
+                    "grok",
+                    getattr(self._grok, "model_name", settings.GROK_MODEL),
+                    lambda: self._grok.chat_structured(
+                        prompt, image_base64=full_image_b64
+                    ),
+                ))
+        return chain
+
+    async def _arbiter(
+        self,
+        panel_verdicts: List[PanelVerdict],
+        agreement: Optional[float],
+        sheet: EvidenceSheet,
+        candidate_names: List[str],
+        kb_text: str,
+        full_image_b64: Optional[str],
+        allowed: set,
+        fallback_primary: str,
+        free_read_styles: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Arbiter: reconcile the panel into a final STYLE MIXTURE.
+
+        Tries OpenAI first, then the injected Gemini/Grok backups (A4b),
+        skipping any provider whose circuit is open. Only when EVERY provider
+        fails does this raise — letting ``run()`` degrade to the panel average.
+        ``free_read_styles`` is the unconstrained image read surfaced as an extra
+        independent opinion (decision C).
+        """
+        prompt = build_agent7_prompt(
+            panel_verdicts, agreement, sheet, candidate_names, kb_text,
+            free_read_styles,
+        )
+        chain = self._arbiter_chain(prompt, full_image_b64)
+        breaker = get_circuit_breaker()
+        last_exc: Optional[BaseException] = None
+        for ignore_open in (False, True):
+            attempted = False
+            for key, model_id, call in chain:
+                if not ignore_open and breaker.is_open(key):
+                    continue
+                attempted = True
+                try:
+                    return await self._run_arbiter_attempt(
+                        key, model_id, call, sheet, allowed, fallback_primary
+                    )
+                except Exception as exc:  # noqa: BLE001 — try the next provider
+                    last_exc = exc
+            if attempted:
+                break  # a closed provider was tried; no need for the last-resort pass
+        raise last_exc or RuntimeError("Arbiter unavailable")
+
+    async def _run_arbiter_attempt(
+        self,
+        provider_key: str,
+        model_id: str,
+        call: Callable[[], Awaitable[str]],
+        sheet: EvidenceSheet,
+        allowed: set,
+        fallback_primary: str,
+    ) -> Dict[str, Any]:
+        """Run one arbiter provider attempt: call → parse → build result.
+
+        Records telemetry + circuit-breaker success/failure. Raises on call or
+        parse failure so the caller can fall through to the next provider.
+        """
+        breaker = get_circuit_breaker()
+        start = time.monotonic()
+        raw: Optional[str] = None
+        try:
+            raw = await asyncio.wait_for(call(), timeout=_TIMEOUT)
+            json_str = OpenAIService.extract_json(raw)
+            data = json.loads(json_str)
+        except Exception as exc:
+            breaker.record_failure(provider_key)
+            _record_run(_ARBITER_AGENT, model_id,
+                        (time.monotonic() - start) * 1000.0, False,
+                        raw=raw, error=str(exc))
+            raise
+        breaker.record_success(provider_key)
+        _record_run(_ARBITER_AGENT, model_id,
+                    (time.monotonic() - start) * 1000.0, True,
+                    raw=raw, parsed=json_str)
+        result = self._build_arbiter_result(data, sheet, allowed, fallback_primary)
+        result["arbiter_provider"] = provider_key
+        return result
+
+    def _build_arbiter_result(
+        self,
+        data: Dict[str, Any],
+        sheet: EvidenceSheet,
+        allowed: set,
+        fallback_primary: str,
+    ) -> Dict[str, Any]:
+        """Turn a parsed arbiter JSON object into the final-result dict."""
+        raw_dist = data.get("style_distribution")
+        if not isinstance(raw_dist, dict) or not raw_dist:
+            raw_dist = {str(data.get("style", fallback_primary)): 1.0}
+        # Recall escape hatch: a style the arbiter named OUTSIDE the candidate set
+        # is admitted only if it matches an existing KB entry AND (when enabled)
+        # the observed evidence backs it — lifts the candidate ceiling without
+        # polluting the KB or admitting an unsupported style (decision #72 / A2).
+        observed_features = [it.feature for it in sheet.items if it.feature]
+        raw_dist, allowed = self._expand_allowed_with_kb(
+            raw_dist, allowed, observed_features
+        )
+        style_dist = build_style_distribution_safe(raw_dist, fallback_primary, allowed)
+
+        composition_explanation = str(
+            data.get("composition_explanation", data.get("explanation", ""))
+        )
+        raw_evidence = data.get("evidence_per_style") or {}
+        raw_key_evidence = [
+            str(b) for b in data.get("key_evidence", []) if str(b).strip()
+        ]
+        evidence_per_style: Dict[str, List[str]] = {}
+        if isinstance(raw_evidence, dict):
+            for style_name, bullets in raw_evidence.items():
+                if style_name in style_dist.distribution and isinstance(bullets, list):
+                    cleaned = [str(b) for b in bullets if str(b).strip()]
+                    if cleaned:
+                        evidence_per_style[style_name] = cleaned
+
+        # Prefer legacy key_evidence for the primary style when the arbiter
+        # emitted the old single-label schema.
+        if style_dist.primary not in evidence_per_style and raw_key_evidence:
+            evidence_per_style[style_dist.primary] = raw_key_evidence
+
+        # Back-fill any style in the mixture that has no evidence bullets.
+        for style_name in style_dist.distribution:
+            if style_name not in evidence_per_style:
+                evidence_per_style[style_name] = [
+                    "(no specific evidence enumerated by the arbiter)"
+                ]
+
+        key_evidence = evidence_per_style.get(style_dist.primary, raw_key_evidence)
+        return {
+            "style": style_dist.primary,
+            "confidence": style_dist.distribution[style_dist.primary],
+            "explanation": composition_explanation,
+            "key_evidence": key_evidence,
+            "style_distribution": style_dist,
+            "composition_explanation": composition_explanation,
+            "evidence_per_style": evidence_per_style or None,
+        }
+
+    async def translate(
+        self,
+        *,
+        explanation: str,
+        key_evidence: List[str],
+        composition_explanation: Optional[str],
+        evidence_per_style: Optional[Dict[str, List[str]]],
+        evidence_sheet: Optional[EvidenceSheet],
+    ) -> tuple[Dict[str, Any], Optional[EvidenceSheet]]:
+        """Translate the narrative + evidence sheet into Vietnamese.
+
+        Two independent best-effort calls in parallel (narrative + sheet):
+        splitting keeps each JSON small/reliable so a failure in one does not
+        blank the other. Public so it can be invoked off the critical path (lazy,
+        on first re-open) as well as inline. Never raises.
+
+        Returns:
+            A ``(translation_dict, evidence_sheet_vi)`` pair. ``translation_dict``
+            holds the ``*_vi`` narrative fields (empty on failure);
+            ``evidence_sheet_vi`` is the translated sheet (None on failure).
+        """
+        translation, sheet_vi = await asyncio.gather(
+            self._translate_result(
+                explanation=explanation,
+                key_evidence=key_evidence,
+                composition_explanation=composition_explanation,
+                evidence_per_style=evidence_per_style,
+            ),
+            self._translate_evidence_sheet(evidence_sheet),
+        )
+        return translation, sheet_vi
 
     async def _translate_result(
         self,
@@ -321,10 +663,16 @@ class PipelineRunner:
     ) -> Dict[str, Any]:
         """Translate the final English narrative into Vietnamese (one text call).
 
-        Returns a dict with keys ``explanation_vi`` / ``key_evidence_vi`` /
-        ``composition_explanation_vi`` / ``evidence_per_style_vi``. On any
-        failure (LLM error, bad JSON) returns an empty dict so the caller leaves
-        the ``*_vi`` fields unset and the frontend falls back to English.
+        Covers ONLY the narrative fields (explanation / key_evidence /
+        composition / evidence_per_style) so the payload — and the JSON the model
+        must return — stays small and reliable. The 12-dimension evidence sheet
+        is translated separately (``_translate_evidence_sheet``) so a failure in
+        one half never blanks the other (which would drop the whole result back
+        to English).
+
+        Best-effort: on any failure returns an empty dict so the caller leaves
+        the ``*_vi`` fields unset and the frontend falls back to English. Uses
+        the DeepSeek text LLM (its JSON mode is reliable).
         """
         payload = {
             "explanation": explanation,
@@ -335,13 +683,13 @@ class PipelineRunner:
         prompt = build_translation_prompt(payload)
         try:
             raw = await asyncio.wait_for(
-                self._text.chat(prompt, temperature=0.2),
+                self._text.chat(prompt, temperature=0.2, json_mode=True),
                 timeout=_TIMEOUT,
             )
         except Exception as exc:  # noqa: BLE001 — boundary: translation is best-effort
             logger.warning("Bilingual translation call failed: %s", exc)
             return {}
-        data = _parse_json_safe(raw)
+        data = parse_json_safe(raw)
         if not data:
             return {}
 
@@ -370,505 +718,394 @@ class PipelineRunner:
             ),
         }
 
-    def _compute_fused_prior(
-        self,
-        *,
-        components: List[DetectedComponent],
-        material: MaterialDistribution,
-        material_available: bool,
-        attributes: Optional[AttributeVector],
-        style_prior: Optional[Dict[str, float]],
-        votes_norm: Dict[str, float],
-        attribute_affinity: Optional[Dict[str, float]],
-    ) -> Dict[str, float]:
-        """Prior anchor: learned fuser when available, else hand-weighted fuse."""
-        if self._fuser is not None and style_prior is not None and attributes is not None:
-            try:
-                return self._fuser.predict(
-                    style_prior, attributes, components, material, material_available
-                )
-            except Exception as exc:  # boundary: model load / predict failure
-                logger.warning("Learned fuser failed; using numeric_fuse: %s", exc)
-        return numeric_fuse(
-            votes_norm,
-            style_prior,
-            attribute_affinity,
-            weight_votes=settings.FUSION_WEIGHT_VOTES,
-            weight_prior=settings.FUSION_WEIGHT_PRIOR,
-            weight_attribute=settings.FUSION_WEIGHT_ATTRIBUTE,
-        )
+    async def _translate_evidence_sheet(
+        self, evidence_sheet: Optional[EvidenceSheet]
+    ) -> Optional[EvidenceSheet]:
+        """Translate the 12-dimension evidence sheet into Vietnamese (own call).
 
-    async def _run_component(
-        self,
-        component: DetectedComponent,
-        material: MaterialDistribution,
-        attributes: Optional[AttributeVector] = None,
-        material_available: bool = True,
-    ) -> ComponentAnalysis:
-        """Run Agents 1-4 for a single component, with material + attribute context.
-
-        Args:
-            component: A DetectedComponent from YOLO.
-            material: Building-level material classification.
-            attributes: Optional building-level visual attribute vector from the
-                global feature extractor; forwarded to Agent 2's prompt so the
-                per-component style scoring can be informed by whole-image
-                geometry and texture.
-            material_available: When False the material signal is mock noise, so
-                it is withheld from Agent 2 and the material-consistency rule is
-                skipped (it would otherwise raise spurious contradictions).
-
-        Returns:
-            ComponentAnalysis with all four agent outputs filled in.
+        Translates each item's ``feature`` / ``note`` and the ``overall_note``,
+        preserving ``dimension`` + ``suggested_styles``. Runs SEPARATELY from the
+        narrative translation, and splits the rows into small batches translated
+        concurrently so no single call's JSON output can be truncated (decision
+        #89). Best-effort: a failed batch leaves those rows in English, and an
+        empty merge returns None → the frontend falls back to the English sheet.
         """
-        ctype = component.component_type
+        if evidence_sheet is None or not evidence_sheet.items:
+            return None
 
-        # Agent 1 — Gemini: geometric description (with image)
-        agent1_text = await asyncio.wait_for(
-            self._vision.generate_with_image(
-                prompt=build_agent1_prompt(ctype),
-                image_base64=component.crop_base64,
-                temperature=0.4,
-            ),
-            timeout=_TIMEOUT,
-        )
-        agent1 = Agent1Output(
-            component_id=component.component_id,
-            feature_description=agent1_text,
-        )
+        indexed = [
+            {"i": i, "feature": it.feature, "note": it.note}
+            for i, it in enumerate(evidence_sheet.items)
+        ]
+        # Translate in small batches so each call's JSON output stays well under
+        # the model's output cap — a single 12-item payload overflows and gets
+        # truncated, blanking the whole sheet (decision #89).
+        batches = [
+            indexed[k:k + _EVIDENCE_TRANSLATE_BATCH]
+            for k in range(0, len(indexed), _EVIDENCE_TRANSLATE_BATCH)
+        ]
 
-        # Agent 2 — Gemini ×3 Monte Carlo: style distribution
-        # (with material + building-level attribute context)
-        agent2 = await self._agent2(
-            component, agent1, material, attributes, material_available
-        )
-
-        # Agent 3a — rule check (sync, no LLM); fuse component + material contradictions
-        top_style = max(agent2.style_distribution, key=lambda k: agent2.style_distribution[k])
-        agent3 = check_rules(ctype, top_style)
-        material_msg = (
-            check_material_consistency(material.dominant, top_style)
-            if material_available
-            else None
-        )
-        if material_msg is not None:
-            agent3 = Agent3Output(
-                component_id=component.component_id,
-                has_contradiction=True,
-                contradiction_analysis=(
-                    f"{agent3.contradiction_analysis} | Material check: {material_msg}"
-                    if agent3.has_contradiction
-                    else material_msg
-                ),
-                violated_rules=agent3.violated_rules + [material_msg],
-            )
-        else:
-            agent3 = Agent3Output(
-                component_id=component.component_id,
-                has_contradiction=agent3.has_contradiction,
-                contradiction_analysis=agent3.contradiction_analysis,
-                violated_rules=agent3.violated_rules,
-            )
-
-        # Agent 3b — DeepSeek fallback if contradiction detected
-        if agent3.has_contradiction:
-            agent3 = await self._agent3b(component, agent2, agent3)
-
-        # Agent 4 — DeepSeek: per-component conclusion
-        agent4 = await self._agent4(component, agent2, agent3)
-
-        return ComponentAnalysis(
-            component_id=component.component_id,
-            component_type=ctype,
-            detection_confidence=component.detection_confidence,
-            bounding_box=component.bounding_box,
-            agent1=agent1,
-            agent2=agent2,
-            agent3=agent3,
-            agent4=agent4,
-        )
-
-    async def _agent2(
-        self,
-        component: DetectedComponent,
-        agent1: Agent1Output,
-        material: MaterialDistribution,
-        attributes: Optional[AttributeVector] = None,
-        material_available: bool = True,
-    ) -> Agent2Output:
-        """Agent 2: Monte Carlo ×3 style distribution, averaged.
-
-        Receives Agent 1's feature description, the building's dominant
-        material AND (optionally) the building-level AttributeVector so the
-        per-component style scoring is informed by whole-image cues. The
-        material line is withheld when ``material_available`` is False.
-        """
-        prompt = build_agent2_prompt(
-            component.component_type,
-            agent1.feature_description,
-            material,
-            attributes,
-            material_available,
-        )
-        distributions: List[Dict[str, float]] = []
-
-        for temp in _AGENT2_TEMPERATURES:
-            try:
-                raw = await asyncio.wait_for(
-                    self._vision.generate_with_image(
-                        prompt=prompt,
-                        image_base64=component.crop_base64,
-                        temperature=temp,
-                    ),
-                    timeout=_TIMEOUT,
-                )
-                dist = _parse_json_safe(raw)
-                distributions.append({s: float(dist.get(s, 0.0)) for s in STYLE_CLASSES})
-            except Exception as exc:
-                logger.warning("Agent 2 call failed (temp=%.1f): %s", temp, exc)
-
-        degraded = not distributions
-        if degraded:
-            # All Monte Carlo calls failed (e.g. Gemini 503). Use a placeholder
-            # uniform so Agent 3a/4 don't break, but mark degraded so this
-            # component is EXCLUDED from vote aggregation (a uniform vote would
-            # otherwise inject noise across all styles).
-            logger.warning(
-                "Agent 2 fully degraded for component %s — excluded from votes",
-                component.component_id,
-            )
-            uniform = 1.0 / len(STYLE_CLASSES)
-            averaged = {s: uniform for s in STYLE_CLASSES}
-        else:
-            averaged = {
-                style: sum(d.get(style, 0.0) for d in distributions) / len(distributions)
-                for style in STYLE_CLASSES
-            }
-            total = sum(averaged.values()) or 1.0
-            averaged = {k: v / total for k, v in averaged.items()}
-
-        return Agent2Output(
-            component_id=component.component_id,
-            style_distribution=averaged,
-            degraded=degraded,
-        )
-
-    async def _agent3b(
-        self,
-        component: DetectedComponent,
-        agent2: Agent2Output,
-        agent3_code: Agent3Output,
-    ) -> Agent3Output:
-        """Agent 3b: DeepSeek interprets a rule contradiction."""
-        top_style = max(
-            agent2.style_distribution, key=lambda k: agent2.style_distribution[k]
-        )
-        prompt = build_agent3b_prompt(
-            component.component_type, agent2.style_distribution, top_style
-        )
-        try:
+        async def _translate_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+            prompt = build_translation_prompt({"evidence_items": items})
             raw = await asyncio.wait_for(
-                self._text.chat(prompt, temperature=0.3),
+                self._text.chat(prompt, temperature=0.2, json_mode=True),
                 timeout=_TIMEOUT,
             )
-            data = _parse_json_safe(raw)
-            return Agent3Output(
-                component_id=component.component_id,
-                has_contradiction=bool(data.get("has_contradiction", True)),
-                contradiction_analysis=str(data.get("contradiction_analysis", "")),
-                violated_rules=list(data.get("violated_rules", [])),
+            return parse_json_safe(raw)
+
+        async def _translate_note(note: str) -> Optional[str]:
+            prompt = build_translation_prompt({"overall_note": note})
+            raw = await asyncio.wait_for(
+                self._text.chat(prompt, temperature=0.2, json_mode=True),
+                timeout=_TIMEOUT,
             )
-        except Exception as exc:
-            logger.warning("Agent 3b failed, using code result: %s", exc)
-            return Agent3Output(
-                component_id=component.component_id,
-                has_contradiction=agent3_code.has_contradiction,
-                contradiction_analysis=agent3_code.contradiction_analysis,
-                violated_rules=agent3_code.violated_rules,
-            )
+            data = parse_json_safe(raw)
+            val = data.get("overall_note") if isinstance(data, dict) else None
+            return str(val) if val else None
 
-    async def _agent4(
+        has_note = bool(evidence_sheet.overall_note)
+        tasks: List[Awaitable[Any]] = [_translate_batch(b) for b in batches]
+        if has_note:
+            tasks.append(_translate_note(evidence_sheet.overall_note))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        note_result = results[-1] if has_note else None
+        batch_results = results[:-1] if has_note else results
+
+        # Merge translated items by global index; a failed batch simply leaves
+        # those rows in English (partial translation beats all-or-nothing).
+        merged: List[Dict[str, Any]] = []
+        for res in batch_results:
+            if isinstance(res, Exception):
+                logger.warning("Evidence-sheet translation batch failed: %s", res)
+                continue
+            items = res.get("evidence_items") if isinstance(res, dict) else None
+            if isinstance(items, list):
+                merged.extend(items)
+
+        if not merged:
+            return None
+        sheet_vi = _rebuild_translated_sheet(evidence_sheet, merged)
+        if sheet_vi is not None and isinstance(note_result, str):
+            sheet_vi.overall_note = note_result
+        return sheet_vi
+
+    async def _runoff(
         self,
-        component: DetectedComponent,
-        agent2: Agent2Output,
-        agent3: Agent3Output,
-    ) -> Agent4Output:
-        """Agent 4: DeepSeek per-component MIXTURE distribution + reasoning.
-
-        Agent 4 now emits a probability distribution over the styles it
-        considers plausible for this single component. Legacy ``style``/
-        ``confidence`` fields on Agent4Output are kept populated from the
-        primary entry of that distribution for backward compatibility with
-        the vote table and downstream prompts.
-        """
-        sorted_styles = sorted(
-            agent2.style_distribution.items(), key=lambda x: x[1], reverse=True
-        )
-        top3 = [s for s, _ in sorted_styles[:3]]
-        fallback_primary = top3[0] if top3 else STYLE_CLASSES[0]
-        prompt = build_agent4_prompt(
-            component_type=component.component_type,
-            top3_styles=top3,
-            style_distribution=agent2.style_distribution,
-            has_contradiction=agent3.has_contradiction,
-            contradiction_analysis=agent3.contradiction_analysis,
-        )
-        raw = await asyncio.wait_for(
-            self._text.chat(prompt, temperature=0.3),
-            timeout=_TIMEOUT,
-        )
-        data = _parse_json_safe(raw)
-        # New mixture field; fall back to legacy {style, confidence} format
-        # so we degrade gracefully if a model emits the old shape.
-        raw_dist = data.get("style_distribution")
-        if not isinstance(raw_dist, dict) or not raw_dist:
-            legacy_style = str(data.get("style", fallback_primary))
-            legacy_conf = _safe_float(data.get("confidence", 0.5))
-            raw_dist = {legacy_style: max(legacy_conf, 1e-3)}
-        style_dist = _build_style_distribution_safe(raw_dist, fallback_primary)
-        primary_prob = style_dist.distribution[style_dist.primary]
-        return Agent4Output(
-            component_id=component.component_id,
-            component_type=component.component_type,
-            style=style_dist.primary,
-            confidence=primary_prob,
-            reasoning=str(data.get("reasoning", "")),
-            style_distribution=style_dist,
-        )
-
-    async def _agent5(
-        self,
-        vote_table: Dict[str, float],
-        summaries: List[str],
-        material: MaterialDistribution,
-        style_prior: Optional[Dict[str, float]] = None,
-        attribute_affinity: Optional[Dict[str, float]] = None,
-        attributes: Optional[AttributeVector] = None,
-        material_available: bool = True,
-        fused_prior: Optional[Dict[str, float]] = None,
-    ) -> Agent5Output:
-        """Agent 5: DeepSeek primary advocate — emit a STYLE MIXTURE.
-
-        Receives all four evidence streams (vote table, material, CNN style
-        prior, attribute affinity) plus the verbose AttributeVector and the
-        numeric ``fused_prior`` anchor. Builds a ``StyleDistribution`` from the
-        LLM-emitted mixture; falls back gracefully to a 1-hot on the top
-        vote-table style if the LLM emits an empty or invalid distribution.
-        """
-        prompt = build_agent5_prompt(
-            vote_table,
-            summaries,
-            material,
-            style_prior,
-            attribute_affinity,
-            attributes,
-            material_available,
-            fused_prior,
-        )
-        raw = await asyncio.wait_for(
-            self._text.chat(prompt, temperature=0.4),
-            timeout=_TIMEOUT,
-        )
-        data = _parse_json_safe(raw)
-        top_vote_style = (
-            max(vote_table, key=lambda k: vote_table[k])
-            if vote_table else STYLE_CLASSES[0]
-        )
-        raw_dist = data.get("style_distribution")
-        if not isinstance(raw_dist, dict) or not raw_dist:
-            # Backward-compat: accept legacy {style, confidence} shape.
-            legacy_style = str(data.get("style", top_vote_style))
-            legacy_conf = _safe_float(data.get("confidence", 0.5))
-            raw_dist = {legacy_style: max(legacy_conf, 1e-3)}
-        style_dist = _build_style_distribution_safe(raw_dist, top_vote_style)
-        primary_prob = style_dist.distribution[style_dist.primary]
-        composition_narrative = str(
-            data.get("composition_narrative", data.get("reasoning", ""))
-        )
-        return Agent5Output(
-            style=style_dist.primary,
-            confidence=primary_prob,
-            reasoning=composition_narrative,
-            style_distribution=style_dist,
-            composition_narrative=composition_narrative,
-        )
-
-    async def _agent6(self, agent5_style: str) -> Agent6Output:
-        """Agent 6: DeepSeek alternative hypothesist (receives label only)."""
-        prompt = build_agent6_prompt(agent5_style)
-        raw = await asyncio.wait_for(
-            self._text.chat(prompt, temperature=0.6),
-            timeout=_TIMEOUT,
-        )
-        data = _parse_json_safe(raw)
-        return Agent6Output(
-            style=str(data.get("style", "Unknown")),
-            confidence=float(data.get("confidence", 0.3)),
-            reasoning=str(data.get("reasoning", "")),
-        )
-
-    async def _agent7(
-        self,
-        agent5: Agent5Output,
-        agent6: Agent6Output,
-        vote_table: Dict[str, float],
-        material: MaterialDistribution,
+        final: Dict[str, Any],
+        sheet: EvidenceSheet,
         full_image_b64: Optional[str],
-        style_prior: Optional[Dict[str, float]] = None,
-        attribute_affinity: Optional[Dict[str, float]] = None,
-        attributes: Optional[AttributeVector] = None,
-        material_available: bool = True,
-        cross_check_note: Optional[str] = None,
-        fused_prior: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        """Agent 7: GPT-4o final arbitrator — fuses 4 streams into a STYLE MIXTURE.
+        """Contrastive run-off between the final top-2 styles (conversion lever).
 
-        Returns a dict the caller uses to populate both legacy and mixture
-        fields on FinalAnalysisResult:
-
-        - ``style``, ``confidence``, ``explanation``, ``key_evidence``:
-          legacy single-label fields derived from the primary style.
-        - ``style_distribution``: validated ``StyleDistribution``.
-        - ``composition_explanation``: narrative from the LLM.
-        - ``evidence_per_style``: per-style bullet evidence, filtered to
-          styles present in the final distribution.
+        Fires only when the two highest-mass styles are within
+        ``RUNOFF_MARGIN_MAX`` — the regime where the right style is available but
+        the decision is genuinely torn. A focused vision call contrasts the two
+        finalists' KB signatures against the image; its verdict is fused
+        MULTIPLICATIVELY with the current split (``_apply_runoff``) so it only
+        overturns the lead when confident. Best-effort: returns ``final``
+        unchanged when disabled, no KB/image, the margin is decisive, a finalist
+        is not in the KB, or the vision call fails.
         """
-        prompt = build_agent7_prompt(
-            agent5,
-            agent6,
-            vote_table,
-            material,
-            style_prior,
-            attribute_affinity,
-            attributes,
-            material_available,
-            cross_check_note,
-            fused_prior,
+        if not settings.RUNOFF_ENABLED or self._kb is None or not full_image_b64:
+            return final
+        dist: Optional[StyleDistribution] = final.get("style_distribution")
+        if dist is None:
+            return final
+        ranked = sorted(
+            dist.distribution.items(), key=lambda kv: kv[1], reverse=True
         )
-        raw = await asyncio.wait_for(
-            self._final.chat_structured(prompt, image_base64=full_image_b64),
-            timeout=_TIMEOUT,
+        if len(ranked) < 2:
+            return final
+        (name_a, prob_a), (name_b, prob_b) = ranked[0], ranked[1]
+        if prob_a - prob_b >= settings.RUNOFF_MARGIN_MAX:
+            return final  # decisive — no run-off needed
+        entry_a = self._kb.match(name_a)
+        entry_b = self._kb.match(name_b)
+        if entry_a is None or entry_b is None:
+            return final
+
+        verdict = await self._runoff_verdict(entry_a, entry_b, sheet, full_image_b64)
+        if verdict is None:
+            return final
+        ro_a, ro_b = verdict
+        new_raw = _apply_runoff(dist.distribution, name_a, name_b, ro_a, ro_b)
+        style_dist = build_style_distribution_safe(
+            new_raw, name_a, set(dist.distribution)
         )
-        json_str = OpenAIService.extract_json(raw)
-        data = json.loads(json_str)
 
-        # Build StyleDistribution from the new mixture field; fall back to the
-        # legacy {style, confidence} shape so older prompts still validate.
-        raw_dist = data.get("style_distribution")
-        if not isinstance(raw_dist, dict) or not raw_dist:
-            legacy_style = str(data.get("style", agent5.style))
-            legacy_conf = _safe_float(data.get("confidence", agent5.confidence))
-            raw_dist = {legacy_style: max(legacy_conf, 1e-3)}
-        style_dist = _build_style_distribution_safe(raw_dist, agent5.style)
-        primary_prob = style_dist.distribution[style_dist.primary]
+        out = dict(final)
+        out["style"] = style_dist.primary
+        out["confidence"] = style_dist.distribution[style_dist.primary]
+        out["style_distribution"] = style_dist
+        # Re-point key_evidence to the (possibly new) primary style.
+        eps = out.get("evidence_per_style") or {}
+        out["key_evidence"] = eps.get(style_dist.primary) or out.get("key_evidence", [])
+        return out
 
-        composition_explanation = str(
-            data.get("composition_explanation", data.get("explanation", ""))
-        )
-        # ``evidence_per_style``: keep only entries that map to styles present
-        # in the final distribution. ``raw_key_evidence`` is the legacy
-        # single-label bullet list — used both as the legacy ``key_evidence``
-        # output AND as a fall-back source of bullets for the primary style
-        # when the LLM emitted the old schema.
-        raw_evidence = data.get("evidence_per_style") or {}
-        raw_key_evidence = [
-            str(b) for b in data.get("key_evidence", []) if str(b).strip()
-        ]
-        evidence_per_style: Dict[str, List[str]] = {}
-        if isinstance(raw_evidence, dict):
-            for style_name, bullets in raw_evidence.items():
-                if (
-                    style_name in style_dist.distribution
-                    and isinstance(bullets, list)
-                ):
-                    cleaned_bullets = [str(b) for b in bullets if str(b).strip()]
-                    if cleaned_bullets:
-                        evidence_per_style[style_name] = cleaned_bullets
+    def _runoff_chain(self, prompt: str, full_image_b64: str) -> List[tuple]:
+        """Ordered (provider_key, model_id, raw-call) chain for the run-off call.
 
-        # Prefer legacy ``key_evidence`` over a placeholder for the primary
-        # style when Agent 7 returned the old schema (no ``evidence_per_style``).
-        if style_dist.primary not in evidence_per_style and raw_key_evidence:
-            evidence_per_style[style_dist.primary] = raw_key_evidence
+        Prefers Grok (cheap, fast vision), then Gemini, then the OpenAI arbiter —
+        all vision-capable. Only providers that were injected are included.
+        """
+        chain: List[tuple] = []
+        if self._grok is not None:
+            chain.append((
+                "grok",
+                getattr(self._grok, "model_name", settings.GROK_MODEL),
+                lambda: self._grok.chat_structured(prompt, image_base64=full_image_b64),
+            ))
+        if self._gemini is not None:
+            chain.append((
+                "gemini",
+                getattr(self._gemini, "model_name", settings.GEMINI_MODEL),
+                lambda: self._gemini.generate_with_image(
+                    prompt, image_base64=full_image_b64, temperature=0.2
+                ),
+            ))
+        chain.append((
+            "openai",
+            getattr(self._arbiter_llm, "model_name", settings.OPENAI_MODEL),
+            lambda: self._arbiter_llm.chat_structured(prompt, image_base64=full_image_b64),
+        ))
+        return chain
 
-        # Defensive: every style that appears in the mixture should still have
-        # at least one bullet of justification. Back-fill any remaining gaps
-        # with a placeholder so the response shape stays consistent for
-        # downstream UI / DB persistence.
-        missing_evidence = [
-            s for s in style_dist.distribution if s not in evidence_per_style
-        ]
-        if missing_evidence:
-            logger.warning(
-                "Agent 7 omitted evidence_per_style for: %s — back-filling placeholders.",
-                missing_evidence,
+    async def _runoff_verdict(
+        self,
+        entry_a: "StyleEntry",
+        entry_b: "StyleEntry",
+        sheet: EvidenceSheet,
+        full_image_b64: str,
+    ) -> Optional[tuple]:
+        """Run the contrastive vision call → (mass_a, mass_b) for the two finalists.
+
+        Tries each provider in the run-off chain (skipping any whose circuit is
+        open), parsing the two-way ``style_distribution``. Returns the two
+        non-negative masses for ``entry_a``/``entry_b`` by case-insensitive name,
+        or None when every provider fails or omits a finalist. Records telemetry
+        + circuit-breaker outcome per attempt.
+        """
+        prompt = build_runoff_prompt(entry_a, entry_b, sheet)
+        breaker = get_circuit_breaker()
+        for key, model_id, call in self._runoff_chain(prompt, full_image_b64):
+            if breaker.is_open(key):
+                continue
+            start = time.monotonic()
+            raw: Optional[str] = None
+            try:
+                raw = await asyncio.wait_for(call(), timeout=_TIMEOUT)
+                data = parse_json_safe(raw)
+                sd = data.get("style_distribution") if isinstance(data, dict) else None
+                if not isinstance(sd, dict):
+                    raise ValueError("run-off returned no style_distribution")
+                lut = {
+                    k.lower(): safe_float(v)
+                    for k, v in sd.items()
+                    if isinstance(k, str)
+                }
+                mass_a = lut.get(entry_a.name.lower())
+                mass_b = lut.get(entry_b.name.lower())
+                if mass_a is None or mass_b is None or (mass_a <= 0 and mass_b <= 0):
+                    raise ValueError("run-off omitted a finalist")
+            except Exception as exc:  # noqa: BLE001 — try the next provider
+                breaker.record_failure(key)
+                _record_run(_RUNOFF_AGENT, model_id,
+                            (time.monotonic() - start) * 1000.0, False,
+                            raw=raw, error=str(exc))
+                continue
+            breaker.record_success(key)
+            _record_run(_RUNOFF_AGENT, model_id,
+                        (time.monotonic() - start) * 1000.0, True,
+                        raw=raw, parsed=json.dumps(sd))
+            return max(0.0, mass_a), max(0.0, mass_b)
+        return None
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _rebuild_translated_sheet(
+    sheet: Optional[EvidenceSheet], translated_items: Any
+) -> Optional[EvidenceSheet]:
+    """Rebuild an EvidenceSheet with Vietnamese ``feature``/``note`` strings.
+
+    Maps the translated items back onto the original sheet by index, preserving
+    each item's ``dimension`` and ``suggested_styles`` (only feature/note are
+    translated). Returns None when there is nothing to translate or the
+    translation payload is unusable, so the frontend falls back to the English
+    sheet.
+    """
+    if sheet is None or not sheet.items or not isinstance(translated_items, list):
+        return None
+    by_index: Dict[int, Dict[str, Any]] = {
+        entry["i"]: entry
+        for entry in translated_items
+        if isinstance(entry, dict) and isinstance(entry.get("i"), int)
+    }
+    new_items: List[EvidenceItem] = []
+    for i, item in enumerate(sheet.items):
+        tr = by_index.get(i, {})
+        feature = tr.get("feature")
+        note = tr.get("note")
+        new_items.append(
+            EvidenceItem(
+                dimension=item.dimension,
+                feature=str(feature) if feature else item.feature,
+                suggested_styles=list(item.suggested_styles),
+                note=str(note) if note is not None else item.note,
             )
-            for style_name in missing_evidence:
-                evidence_per_style[style_name] = [
-                    "(no specific evidence enumerated by Agent 7)"
-                ]
-
-        # Legacy ``key_evidence`` mirrors the primary style's bullets — falls
-        # back to the original ``data["key_evidence"]`` only if the LLM
-        # emitted nothing else.
-        key_evidence = evidence_per_style.get(style_dist.primary, raw_key_evidence)
-
-        return {
-            "style": style_dist.primary,
-            "confidence": primary_prob,
-            "explanation": composition_explanation,
-            "key_evidence": key_evidence,
-            "style_distribution": style_dist,
-            "composition_explanation": composition_explanation,
-            "evidence_per_style": evidence_per_style or None,
-        }
+        )
+    return EvidenceSheet(
+        items=new_items,
+        proposed_styles=list(sheet.proposed_styles),
+        overall_note=sheet.overall_note,
+    )
 
 
-def compute_aggregated_votes(
-    components: List[ComponentAnalysis],
+def _apply_runoff(
+    distribution: Dict[str, float],
+    name_a: str,
+    name_b: str,
+    ro_a: float,
+    ro_b: float,
 ) -> Dict[str, float]:
-    """Compute weighted style votes across all components.
+    """Fuse a run-off verdict into the top-2 of a mixture, multiplicatively.
 
-    Each component's Agent 2 style distribution is multiplied by its
-    detection confidence, then summed across all components. Components whose
-    Agent 2 fully failed (``agent2.degraded``) are skipped — their placeholder
-    uniform distribution would otherwise inject noise across every style.
+    The two finalists keep their COMBINED mass; how it is split is updated by
+    treating the run-off as independent evidence: ``p_new ∝ p_old × p_runoff``.
+    A confident run-off (e.g. 0.2/0.8) can overturn a small arbiter lead, while a
+    large arbiter lead survives a mild run-off — so a correct top-1 is not flipped
+    on a coin toss. Every other style is left untouched. Returns the input
+    unchanged when the run-off carries no usable signal.
 
     Args:
-        components: Results from Tier 1 (per-component analyses).
+        distribution: The current style → probability mixture.
+        name_a: The current top-1 style name (must be a key of ``distribution``).
+        name_b: The current runner-up style name (must be a key).
+        ro_a: Run-off mass for ``name_a`` (≥ 0).
+        ro_b: Run-off mass for ``name_b`` (≥ 0).
 
     Returns:
-        Dict mapping style name → aggregated weighted score (not normalised).
+        A new distribution dict with the top-2 re-split (not yet normalised).
     """
-    totals: Dict[str, float] = {s: 0.0 for s in STYLE_CLASSES}
-    for ca in components:
-        if ca.agent2.degraded:
-            continue
-        weight = ca.detection_confidence
-        for style, prob in ca.agent2.style_distribution.items():
-            if style in totals:
-                totals[style] += prob * weight
-    return totals
+    combined = distribution.get(name_a, 0.0) + distribution.get(name_b, 0.0)
+    weight_a = distribution.get(name_a, 0.0) * max(0.0, ro_a)
+    weight_b = distribution.get(name_b, 0.0) * max(0.0, ro_b)
+    total = weight_a + weight_b
+    if combined <= 0 or total <= 0:
+        return dict(distribution)
+    updated = dict(distribution)
+    updated[name_a] = combined * weight_a / total
+    updated[name_b] = combined * weight_b / total
+    return updated
 
 
-def _normalize_votes(votes: Dict[str, float]) -> Dict[str, float]:
-    """Normalise raw weighted votes to sum=1.0; pass through if total is 0.
+def _gate_out_of_kb_primary(
+    final: Dict[str, Any],
+    out_of_kb_names: set,
+    valid_judges: int,
+    agreement: Optional[float],
+    allowed: set,
+    fallback_primary: str,
+) -> tuple[Dict[str, Any], bool]:
+    """Demote an out-of-KB primary unless the panel cleared the higher bar.
 
-    The aggregated vote table is a weighted SUM (can exceed 1.0). Normalising
-    before it enters the Agent 5/7 prompts makes the magnitudes interpretable
-    as relative weights. An all-zero table (no votes) is returned unchanged.
+    An out-of-KB style has no curated provenance, so it may only stay the primary
+    result when the inter-judge agreement is strong enough: ≥ 3 valid judges AND
+    ``agreement >= OUT_OF_KB_AGREEMENT_MIN``. Otherwise its mass is dropped and the
+    mixture is rebuilt from the in-KB remainder, returning the best in-KB style as
+    primary. A non-out-of-KB primary is returned unchanged.
+
+    Returns:
+        ``(final, demoted)`` — the (possibly rebuilt) result dict and whether a
+        demotion happened.
     """
-    total = sum(votes.values())
-    if total <= 0:
-        return dict(votes)
-    return {k: v / total for k, v in votes.items()}
+    dist: Optional[StyleDistribution] = final.get("style_distribution")
+    if dist is None or dist.primary not in out_of_kb_names:
+        return final, False
+    meets_bar = (
+        valid_judges >= 3
+        and agreement is not None
+        and agreement >= settings.OUT_OF_KB_AGREEMENT_MIN
+    )
+    if meets_bar:
+        return final, False
+    in_kb_allowed = {a for a in allowed if a not in out_of_kb_names}
+    remaining = {
+        s: p for s, p in dist.distribution.items() if s not in out_of_kb_names
+    }
+    if not remaining:
+        remaining = {fallback_primary: 1.0}
+    style_dist = build_style_distribution_safe(
+        remaining, fallback_primary, in_kb_allowed or None
+    )
+    out = dict(final)
+    out["style"] = style_dist.primary
+    out["confidence"] = style_dist.distribution[style_dist.primary]
+    out["style_distribution"] = style_dist
+    eps = out.get("evidence_per_style") or {}
+    out["key_evidence"] = eps.get(style_dist.primary) or out.get("key_evidence", [])
+    return out, True
+
+
+def _build_evidence_votes(sheet: EvidenceSheet) -> Dict[str, float]:
+    """Tally how many evidence dimensions support each proposed style.
+
+    Counts FREQUENCY (one vote per dimension that suggests the style); it does
+    NOT multiply by any self-reported confidence (unreliable). The result is a
+    SOFT ranking hint for the prompts / fallback — not a final probability.
+    """
+    acc: Dict[str, float] = {}
+    for item in sheet.items:
+        for style in item.suggested_styles:
+            name = style.strip()
+            if name:
+                acc[name] = acc.get(name, 0.0) + 1.0
+    total = sum(acc.values()) or 1.0
+    return {k: v / total for k, v in acc.items()}
+
+
+def _fallback_primary(evidence_votes: Dict[str, float], candidate_names: List[str]) -> str:
+    """Pick a primary style without an LLM (top candidate by evidence votes)."""
+    if candidate_names:
+        return max(candidate_names, key=lambda n: evidence_votes.get(n, 0.0))
+    if evidence_votes:
+        return max(evidence_votes, key=evidence_votes.get)
+    return "Unknown"
+
+
+def _is_hybrid(
+    final_dist: Optional[StyleDistribution], extraction_agreement: Optional[float]
+) -> bool:
+    """Decide whether the result is a multi-style (hybrid) building.
+
+    True when EITHER the final mixture carries ≥ 2 styles each at least
+    ``HYBRID_MASS_MIN`` of the mass (the arbiter produced a genuine mixture), OR
+    the extraction calls disagreed — ``extraction_agreement`` below
+    ``EXTRACTION_AGREEMENT_MIN`` — which signals a multi-style/ambiguous reading
+    even when the arbiter forced a thin single-label winner. Independent of the
+    ``uncertain`` abstention flag.
+    """
+    significant = 0
+    if final_dist is not None:
+        significant = sum(
+            1
+            for p in final_dist.distribution.values()
+            if p >= settings.HYBRID_MASS_MIN
+        )
+    if significant >= 2:
+        return True
+    return (
+        extraction_agreement is not None
+        and extraction_agreement < settings.EXTRACTION_AGREEMENT_MIN
+    )
 
 
 def _distribution_stats(distribution: Dict[str, float]) -> tuple[float, float]:
     """Return (certainty_margin, Shannon entropy in nats) for a mixture.
 
     ``margin`` = primary − second-best probability (1.0 for a 1-hot, 0.0 when
-    the top two are tied). ``entropy`` = -Σ p·ln(p) over positive probabilities
-    (0.0 for a 1-hot, higher = more spread / less certain).
+    the top two are tied). ``entropy`` = -Σ p·ln(p) over positive probabilities.
     """
     probs = sorted((p for p in distribution.values() if p > 0), reverse=True)
     if not probs:
@@ -878,28 +1115,164 @@ def _distribution_stats(distribution: Dict[str, float]) -> tuple[float, float]:
     return round(margin, 4), round(entropy, 4)
 
 
-def _numeric_fallback(
-    fused_prior: Dict[str, float],
-) -> tuple[Agent5Output, Agent6Output, Dict[str, Any]]:
-    """Build (agent5, agent6, final-dict) from the numeric fused prior.
+def _judge_weights(distributions: List[Dict[str, float]]) -> List[float]:
+    """Weight each judge by decisiveness (lower entropy → higher weight).
 
-    Used when the Tier-2 LLM fusion is unavailable so the pipeline still
-    returns a coherent verdict (degraded) instead of raising.
+    A judge whose mixture is peaked (a confident ranking) contributes more to the
+    panel average than one spreading mass evenly. Weights are floored at 0.1 so
+    no valid judge is silenced; a 1-style mixture gets full weight.
     """
-    primary = max(fused_prior, key=fused_prior.get)
-    style_dist = _build_style_distribution_safe(fused_prior, primary)
-    primary_prob = style_dist.distribution[style_dist.primary]
-    note = "Numeric fusion fallback (LLM fusion unavailable)."
-    agent5 = Agent5Output(
-        style=style_dist.primary,
-        confidence=primary_prob,
-        reasoning=note,
-        style_distribution=style_dist,
-        composition_narrative=None,
+    weights: List[float] = []
+    for dist in distributions:
+        probs = [p for p in dist.values() if p > 0]
+        if len(probs) <= 1:
+            weights.append(1.0)
+            continue
+        entropy = -sum(p * math.log(p) for p in probs)
+        norm = entropy / math.log(len(probs))  # in [0, 1]
+        weights.append(max(0.1, 1.0 - norm))
+    return weights
+
+
+def _run_quality(
+    valid_judges: int,
+    attempted_judges: int,
+    extraction_completeness: float,
+    extraction_agreement: Optional[float],
+) -> float:
+    """Return a [0,1] run-quality multiplier for the final confidence.
+
+    Penalises a degraded run: missing judges, lost extraction calls, and
+    disagreeing extraction calls each pull it down. Structural (no tuned
+    threshold), so it does not overfit the benchmark:
+
+        quality = geo_mean(judge_completeness, extraction_completeness)
+                  × (0.5 + 0.5·extraction_agreement)
+    """
+    judge_completeness = (valid_judges / attempted_judges) if attempted_judges else 1.0
+    ext_complete = max(0.0, min(1.0, extraction_completeness))
+    base = math.sqrt(max(0.0, judge_completeness) * ext_complete)
+    agree = 0.5 if extraction_agreement is None else max(0.0, min(1.0, extraction_agreement))
+    return base * (0.5 + 0.5 * agree)
+
+
+def _run_status(
+    valid_judges: int,
+    attempted_judges: int,
+    extraction_completeness: float,
+    degraded: bool,
+) -> str:
+    """Classify the run's health into completed / degraded / failed (A4b).
+
+    ``failed`` = no judge produced a usable verdict (the result is only a
+    fallback guess); ``degraded`` = some judge or extraction call was lost, or
+    the arbiter fell back / inputs were thin (``degraded`` flag); otherwise
+    ``completed``. Stored in DetailJson; the AnalysisStatus DB column keeps its
+    documented vocabulary.
+    """
+    if valid_judges == 0:
+        return "failed"
+    if (
+        degraded
+        or extraction_completeness < 1.0
+        or valid_judges < attempted_judges
+    ):
+        return "degraded"
+    return "completed"
+
+
+def _merge_narrative(
+    arbiter_final: Dict[str, Any], panel_dist: StyleDistribution
+) -> Dict[str, Any]:
+    """Swap in the panel's mixture but keep the arbiter's narrative (W1).
+
+    The arbiter still authored the explanation / evidence-per-style; only the
+    decided distribution (and its derived primary / confidence / key_evidence) is
+    replaced by the panel's. ``key_evidence`` is re-pointed to the new primary
+    when the arbiter enumerated evidence for it.
+    """
+    primary = panel_dist.primary
+    evidence_per_style = arbiter_final.get("evidence_per_style") or {}
+    key_evidence = evidence_per_style.get(primary) or arbiter_final.get("key_evidence", [])
+    out = dict(arbiter_final)
+    out["style"] = primary
+    out["confidence"] = panel_dist.distribution[primary]
+    out["style_distribution"] = panel_dist
+    out["key_evidence"] = key_evidence
+    return out
+
+
+def decide_final_distribution(
+    mode: str,
+    arbiter_final: Dict[str, Any],
+    valid_dists: List[Dict[str, float]],
+    judge_weights: List[float],
+    candidate_names: List[str],
+    agreement: Optional[float],
+    allowed: set,
+    fallback_primary: str,
+) -> Dict[str, Any]:
+    """Choose the final mixture per ``DECISION_MODE`` (W1 redesign).
+
+    - ``arbiter``   : the arbiter's own mixture (baseline; unchanged behaviour).
+    - ``panel``     : the decisiveness-weighted mean of the judges; the arbiter
+                      contributes only the narrative.
+    - ``consensus`` : the panel mean when the panel is DECISIVE (agreement ≥
+                      ``PANEL_AGREEMENT_MIN`` AND a clear margin); otherwise the
+                      arbiter breaks the tie. Also defers to the arbiter when it
+                      used the escape hatch (primary outside the candidate set) so
+                      the recall-lifting upside survives.
+
+    Falls back to the arbiter's mixture whenever the panel produced nothing
+    usable. The arbiter is ALWAYS still called upstream (for the narrative and the
+    tie-break signal); this function only decides which distribution becomes final.
+    """
+    if mode == "arbiter" or not valid_dists:
+        return arbiter_final
+    panel_mean = weighted_mean_distribution(valid_dists, candidate_names, judge_weights)
+    if not panel_mean:
+        return arbiter_final
+    panel_dist = build_style_distribution_safe(panel_mean, fallback_primary, allowed)
+    if mode == "panel":
+        return _merge_narrative(arbiter_final, panel_dist)
+    # mode == "consensus"
+    arbiter_primary = arbiter_final.get("style")
+    escaped = arbiter_primary is not None and arbiter_primary not in set(candidate_names)
+    panel_margin, _ = _distribution_stats(panel_dist.distribution)
+    panel_decisive = (
+        agreement is not None
+        and agreement >= settings.PANEL_AGREEMENT_MIN
+        and panel_margin >= settings.UNCERTAINTY_MARGIN_MIN
     )
-    alt = style_dist.secondary[0] if style_dist.secondary else style_dist.primary
-    agent6 = Agent6Output(style=alt, confidence=0.0, reasoning="n/a (numeric fallback)")
-    final = {
+    if escaped or not panel_decisive:
+        return arbiter_final  # arbiter breaks the tie / lifts the recall ceiling
+    return _merge_narrative(arbiter_final, panel_dist)
+
+
+def _panel_fallback(
+    valid_dists: List[Dict[str, float]],
+    judge_weights: List[float],
+    candidate_names: List[str],
+    fallback_primary: str,
+    allowed: set,
+) -> Dict[str, Any]:
+    """Build a final-result dict from the panel average when the arbiter fails.
+
+    Uses the decisiveness-weighted mean of the valid judges' distributions
+    (better than a single evidence-vote guess); degrades to a 1-hot on
+    ``fallback_primary`` when no judge succeeded.
+    """
+    mean = weighted_mean_distribution(valid_dists, candidate_names, judge_weights)
+    if mean:
+        style_dist = build_style_distribution_safe(mean, fallback_primary, allowed)
+        note = "Arbiter unavailable; final mixture is the panel average."
+    else:
+        style_dist = build_style_distribution_safe(
+            {fallback_primary: 1.0}, fallback_primary, None
+        )
+        note = "Arbiter and panel unavailable; evidence-vote fallback used."
+    primary_prob = style_dist.distribution[style_dist.primary]
+    return {
         "style": style_dist.primary,
         "confidence": primary_prob,
         "explanation": note,
@@ -908,79 +1281,3 @@ def _numeric_fallback(
         "composition_explanation": None,
         "evidence_per_style": None,
     }
-    return agent5, agent6, final
-
-
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    """Convert an arbitrary JSON-decoded value to float, falling back on failure."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _build_style_distribution_safe(
-    raw: Dict[str, Any],
-    fallback_primary: str,
-) -> StyleDistribution:
-    """Construct a validated StyleDistribution from a raw LLM-emitted dict.
-
-    Filters out unknown style names, coerces values to non-negative floats,
-    normalises to sum=1.0, then computes ``primary`` (argmax) and ``secondary``
-    (styles whose normalised probability is at least ``_SECONDARY_THRESHOLD``,
-    ranked descending and excluding primary).
-
-    If the cleaned dict contains no positive probability, falls back to a
-    1-hot distribution on ``fallback_primary`` so the caller always receives
-    a valid object.
-    """
-    cleaned: Dict[str, float] = {}
-    for key, value in raw.items():
-        if key not in STYLE_CLASSES:
-            continue
-        prob = max(0.0, _safe_float(value, default=0.0))
-        if prob > 0:
-            cleaned[key] = prob
-    if not cleaned:
-        cleaned = {fallback_primary: 1.0}
-    total = sum(cleaned.values())
-    normalised = {k: v / total for k, v in cleaned.items()}
-    primary = max(normalised, key=normalised.get)
-    secondary = sorted(
-        (s for s, p in normalised.items() if s != primary and p >= _SECONDARY_THRESHOLD),
-        key=lambda s: -normalised[s],
-    )
-    return StyleDistribution(
-        distribution=normalised,
-        primary=primary,
-        secondary=secondary,
-    )
-
-
-def _parse_json_safe(raw: str) -> Dict:
-    """Extract and parse the first JSON object from a raw LLM response.
-
-    Handles responses that wrap JSON in markdown code fences.
-
-    Args:
-        raw: Raw text from an LLM call.
-
-    Returns:
-        Parsed dict, or empty dict if parsing fails.
-    """
-    import re
-    text = raw.strip()
-    # Strip markdown code fence if present
-    fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
-    if fence_match:
-        text = fence_match.group(1)
-    else:
-        # Find first {...} block
-        brace_match = re.search(r"\{[\s\S]*\}", text)
-        if brace_match:
-            text = brace_match.group(0)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning("JSON parse failed: %s | raw[:200]: %s", exc, raw[:200])
-        return {}

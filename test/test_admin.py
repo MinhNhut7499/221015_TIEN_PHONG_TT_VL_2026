@@ -10,7 +10,7 @@ Groups:
 - Stub shape      : empty lists + non-empty 'note' field on all DB stubs
 """
 from pathlib import Path
-from unittest.mock import PropertyMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -18,6 +18,14 @@ from httpx import ASGITransport, AsyncClient
 from app.config import settings
 from app.main import app
 from app.security.security import create_access_token
+
+
+def _user_row_result(email: str, role_name: str, rowcount: int = 1) -> MagicMock:
+    """Mock result whose .first() returns (email, role_name) with a rowcount."""
+    result = MagicMock()
+    result.first.return_value = (email, role_name)
+    result.rowcount = rowcount
+    return result
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
@@ -98,8 +106,9 @@ async def test_admin_get_endpoints_return_200(
 
 
 @pytest.mark.asyncio
-async def test_update_user_status_returns_200(admin_token: str) -> None:
-    """PATCH /admin/users/{id}/status returns 200 with admin token."""
+async def test_update_user_status_returns_200(admin_token: str, override_get_db) -> None:
+    """PATCH /admin/users/{id}/status returns 200 when target is a regular user."""
+    override_get_db.execute.return_value = _user_row_result("u@test.com", "user")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.patch(
             "/admin/users/some-user-id/status",
@@ -107,6 +116,31 @@ async def test_update_user_status_returns_200(admin_token: str) -> None:
             headers={"Authorization": f"Bearer {admin_token}"},
         )
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_update_user_status_blocks_admin(admin_token: str, override_get_db) -> None:
+    """Deactivating an admin account is rejected with 400."""
+    override_get_db.execute.return_value = _user_row_result("boss@test.com", "admin")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            "/admin/users/admin-user-id/status",
+            json={"is_active": False},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_user_status_404_when_missing(admin_token: str) -> None:
+    """Toggling a non-existent user returns 404 (default empty-DB mock)."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            "/admin/users/ghost-id/status",
+            json={"is_active": False},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -129,6 +163,146 @@ async def test_delete_image_returns_200(admin_token: str) -> None:
             headers={"Authorization": f"Bearer {admin_token}"},
         )
     assert response.status_code == 200
+
+
+# ── New detail / file endpoints ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_project_detail_404_when_missing(admin_token: str) -> None:
+    """GET /admin/projects/{id} returns 404 when the project does not exist."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/admin/projects/ghost-id", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_project_detail_returns_200(admin_token: str, override_get_db) -> None:
+    """GET /admin/projects/{id} returns the project plus its image summaries."""
+    proj = MagicMock(
+        ProjectId="p1", UserId="u1", ProjectName="Default", Description=None, CreatedAt=None
+    )
+    img = MagicMock(ImageId="i1", ImagePath="x/i1.jpg", AnalysisStatus="completed", UploadedAt=None)
+    bsr = MagicMock(FinalStyle="Gothic", Confidence=0.6)
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = proj
+    result.all.return_value = [(img, bsr)]
+    override_get_db.execute.return_value = result
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/admin/projects/p1", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["project_id"] == "p1"
+    assert body["total_images"] == 1
+    assert body["images"][0]["style"] == "Gothic"
+
+
+@pytest.mark.asyncio
+async def test_image_detail_404_when_missing(admin_token: str) -> None:
+    """GET /admin/images/{id} returns 404 when the image does not exist."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/admin/images/ghost-id", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_image_detail_returns_detail_json(admin_token: str, override_get_db) -> None:
+    """GET /admin/images/{id} returns the stored DetailJson (admin, any owner)."""
+    import json as _json
+
+    img = MagicMock(ImageId="i1", ImagePath="D:\\up\\file-xyz.jpg")
+    bsr = MagicMock(DetailJson=_json.dumps({"style": "Baroque", "confidence": 0.7}))
+    result = MagicMock()
+    result.first.return_value = (img, bsr)
+    override_get_db.execute.return_value = result
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/admin/images/i1", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["style"] == "Baroque"
+    assert body["image_id"] == "i1"
+    assert body["file_id"] == "file-xyz"
+
+
+@pytest.mark.asyncio
+async def test_serve_file_404_when_missing(
+    tmp_path: Path, admin_token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /admin/files/{id}/raw returns 404 when no matching file exists."""
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/admin/files/missing-id/raw", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_file_returns_200(
+    tmp_path: Path, admin_token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /admin/files/{id} removes the on-disk file and reports deleted=True."""
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path))
+    (tmp_path / "abc.jpg").write_bytes(b"x")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(
+            "/admin/files/abc", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["file_id"] == "abc"
+    assert body["deleted"] is True
+    assert not (tmp_path / "abc.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_file_blocked_when_linked(
+    tmp_path: Path, admin_token: str, override_get_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /admin/files/{id} returns 409 and keeps the file when it is linked."""
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path))
+    (tmp_path / "linked.jpg").write_bytes(b"x")
+    result = MagicMock()
+    scalars = MagicMock()
+    scalars.all.return_value = ["D:\\up\\linked.jpg"]  # an Image references file_id "linked"
+    result.scalars.return_value = scalars
+    override_get_db.execute.return_value = result
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(
+            "/admin/files/linked", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 409
+    assert (tmp_path / "linked.jpg").exists()  # not deleted
+
+
+@pytest.mark.asyncio
+async def test_delete_image_unlinks_physical_file(
+    tmp_path: Path, admin_token: str, override_get_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /admin/images/{id} also removes the analysis's physical file."""
+    monkeypatch.setattr(settings, "UPLOAD_DIR", str(tmp_path))
+    (tmp_path / "img1.jpg").write_bytes(b"x")
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = str(tmp_path / "img1.jpg")
+    result.rowcount = 1
+    override_get_db.execute.return_value = result
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(
+            "/admin/images/i1", headers={"Authorization": f"Bearer {admin_token}"}
+        )
+    assert response.status_code == 200
+    assert not (tmp_path / "img1.jpg").exists()  # file cleaned up
 
 
 # ── Email fallback ─────────────────────────────────────────────────────────────

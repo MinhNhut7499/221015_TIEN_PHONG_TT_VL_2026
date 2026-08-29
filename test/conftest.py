@@ -13,6 +13,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.main import app
+from chatbot.utils.circuit_breaker import get_circuit_breaker
+
+
+@pytest.fixture(autouse=True)
+def reset_circuit_breaker():
+    """Clear the shared provider circuit breaker before each test.
+
+    The breaker is a process-wide singleton; failures injected by one test must
+    not leak into the next (e.g. opening a provider's circuit), so reset it.
+    """
+    get_circuit_breaker().reset()
+    yield
 
 
 def _make_empty_result() -> MagicMock:

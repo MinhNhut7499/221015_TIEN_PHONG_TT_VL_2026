@@ -44,15 +44,19 @@ async def test_me_user_not_in_db_returns_404(user_token: str) -> None:
 
 @pytest.mark.asyncio
 async def test_me_returns_profile(user_token: str, override_get_db) -> None:
-    """A valid token with a matching DB row returns the profile fields."""
+    """A valid token with a matching DB row returns the profile + wallet fields."""
     fake_user = MagicMock()
     fake_user.Name = "Test User"
     fake_user.Email = "user@test.com"
     fake_user.Picture = "https://example.com/avatar.png"
 
-    result = MagicMock()
-    result.first.return_value = (fake_user, "user")
-    override_get_db.execute.return_value = result
+    # First execute: the get_me User+Role join. Second execute: get_wallet's
+    # (balance, plan_id, expires_at) lookup (plan_id None → no further query).
+    profile_result = MagicMock()
+    profile_result.first.return_value = (fake_user, "user")
+    wallet_result = MagicMock()
+    wallet_result.first.return_value = (25, None, None)
+    override_get_db.execute.side_effect = [profile_result, wallet_result]
 
     headers = {"Authorization": f"Bearer {user_token}"}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -60,9 +64,9 @@ async def test_me_returns_profile(user_token: str, override_get_db) -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {
-        "name": "Test User",
-        "email": "user@test.com",
-        "picture": "https://example.com/avatar.png",
-        "role": "user",
-    }
+    assert body["name"] == "Test User"
+    assert body["email"] == "user@test.com"
+    assert body["picture"] == "https://example.com/avatar.png"
+    assert body["role"] == "user"
+    assert body["token_balance"] == 25
+    assert body["plan_code"] is None

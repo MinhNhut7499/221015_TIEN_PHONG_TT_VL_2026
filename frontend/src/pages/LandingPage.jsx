@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
+import { useApp } from '../context/AppContext';
+import { getPublishedContent, getCmsDraftContent } from '../utils/api';
 import {
-    Landmark, Sun, Moon, Rocket, Brain, Gauge, SearchCheck, Layers,
-    Eye, ShieldCheck, CloudUpload, Search, ArrowRight, Github, Facebook
+    Sun, Moon, Rocket, Users, SearchCheck, Layers,
+    Eye, ShieldCheck, Globe, BookOpen, Search, ArrowRight, Github, Facebook
 } from "lucide-react";
 
 const BoltIcon = () => (
@@ -27,59 +29,71 @@ const XIcon = () => (
 const translations = {
     en: {
         "nav-home": "Home", "nav-features": "Features", "nav-tech": "Tech", "nav-try": "Try Free",
-        "hero-badge": "AI-Powered Architectural Recognition",
-        "hero-title-1": "Understand the", "hero-title-2": "Soul of Buildings",
-        "hero-desc": "An AI system that analyzes architectural images and returns architectural styles with confidence scores and detailed explanations.",
-        "hero-cta-1": "Try it now", "hero-cta-2": "Login with Google", "hero-analysis-status": "Processing Analysis...",
-        "feat-title": "Precision Analysis Tools", "feat-desc": "Our advanced vision models provide deep insights into structural aesthetics and historical context.",
-        "feat-1-h": "AI Analysis", "feat-1-p": "Deep neural networks trained on millions of architectural landmarks globally.",
-        "feat-2-h": "Confidence Score", "feat-2-p": "Get probabilistic certainties for primary and secondary style influences.",
-        "feat-3-h": "Explainable Results", "feat-3-p": "Understand why a style was chosen with detailed structural breakdowns.",
-        "feat-4-h": "Component Detection", "feat-4-p": "Identify specific elements like domes, spires, arches, or solomonic columns.",
-        "styles-title": "Supported Styles", "styles-desc": "Our AI is trained to recognize a wide spectrum of historical and modern movements.",
-        "comp-title": "Detected Components (8 Types)",
+        "hero-badge": "Open-Vocabulary Architecture Recognition",
+        "hero-title-1": "Recognise", "hero-title-2": "100+ World Styles",
+        "hero-desc": "An AI system that identifies architectural styles from a single photo — across 100+ styles worldwide, including non-Western traditions. No fixed list, no retraining: a 3-judge AI panel reasons over 12 dimensions of structural evidence and abstains honestly when unsure.",
+        "hero-cta-1": "Try it now", "hero-cta-2": "Login with Google", "hero-analysis-status": "AI panel reaching consensus...",
+        "feat-title": "How the system reasons", "feat-desc": "Instead of one black-box classifier, the system grounds every verdict in evidence, a knowledge base, and an independent panel of AI judges.",
+        "feat-1-h": "Open Knowledge Base", "feat-1-p": "106 styles across 12 families (Ancient → Contemporary, including Mughal, Khmer, Byzantine and more). Adding a style is one KB entry — no retraining.",
+        "feat-2-h": "3-Judge AI Panel", "feat-2-p": "Gemini, DeepSeek and OpenAI score the candidates independently. Inter-judge agreement decides confidence; low agreement → the system abstains.",
+        "feat-3-h": "Evidence in 12 Dimensions", "feat-3-p": "Massing, roof, arches, ornament, material and more — each named feature is shown explicitly, then explained in English and Vietnamese.",
+        "feat-4-h": "Hybrid & Honest", "feat-4-p": "Eclectic buildings are reported as a style mixture, not forced into one label. When evidence is thin, the answer is \"uncertain — could be X / Y / Z\".",
+        "styles-title": "A World of Styles", "styles-desc": "Representative families from the 106-style knowledge base — Western and non-Western alike.",
+        "comp-title": "12 Evidence Dimensions",
+        "comp-sub": "What the vision agent observes in every image",
         "tech-title": "Technology Stack",
-        "tech-1-h": "Vision Model", "tech-1-p": "Proprietary convolutional neural networks optimized for spatial geometry.",
-        "tech-2-h": "Secure Auth", "tech-2-p": "Google OAuth 2.0 integration for enterprise-grade security.",
-        "tech-3-h": "Cloud Infrastructure", "tech-3-p": "Scalable real-time processing with global edge deployment.",
+        "tech-1-h": "Multimodal Vision", "tech-1-p": "Gemini 2.5 Flash fills a structured 12-dimension evidence sheet directly from the image.",
+        "tech-2-h": "Multi-LLM Panel + Arbiter", "tech-2-p": "Three independent judges plus a GPT-4o arbiter that reconciles them with the full image.",
+        "tech-3-h": "Grounded Knowledge Base", "tech-3-p": "106 styles anchored to Getty AAT, Wikidata and Banister Fletcher — every verdict is traceable.",
         "how-title": "How It Works",
-        "how-1-h": "Login via Google", "how-1-p": "Authenticate securely to access personalized analysis history and advanced features.",
-        "how-2-h": "Upload Architecture", "how-2-p": "Upload images up to 10MB. Our system supports high-resolution RAW formats for maximum detail.",
-        "how-3-h": "Deep Recognition", "how-3-p": "AI scans structural vectors, materials, and historical markers to determine the style.",
-        "how-4-h": "Detailed Report", "how-4-p": "Get a comprehensive PDF report including style lineage and component detection results.",
-        "cta-title": "Ready to decode architecture?", "cta-p": "Upload your image and discover architectural style instantly.", "cta-btn": "Start Analysis",
-        "footer-copyright": "© 2026 ArchiAI. All rights reserved. Precision architectural intelligence.",
-        "style-gothic": "Gothic", "style-baroque": "Baroque", "style-renaissance": "Renaissance",
-        "style-neoclassical": "Neoclassical", "style-artnouveau": "Art Nouveau", "style-artdeco": "Art Deco",
-        "style-modernism": "Modernism", "style-postmodernism": "Postmodernism", "style-brutalism": "Brutalism", "style-hitech": "High-tech"
+        "how-1-h": "Login via Google", "how-1-p": "Authenticate securely to access your personal analysis history.",
+        "how-2-h": "Upload a Photo", "how-2-p": "Upload a building image up to 10MB (JPG, PNG, WEBP).",
+        "how-3-h": "Evidence & Panel", "how-3-p": "The vision agent extracts evidence; candidates are grounded in the KB; the 3-judge panel scores them.",
+        "how-4-h": "Bilingual Result", "how-4-p": "Get the style mixture, per-style evidence and a full explanation in English and Vietnamese.",
+        "cta-title": "Ready to read any building?", "cta-p": "Upload a photo and discover its architectural style — anywhere in the world.", "cta-btn": "Start Analysis",
+        "footer-copyright": "© 2026 ArchiAI — Open-Vocabulary Architecture Recognition",
+        "footer-privacy": "Privacy", "footer-terms": "Terms",
+        // Representative style families (shown on the styles grid)
+        "fam-1": "Gothic", "fam-2": "Baroque", "fam-3": "Renaissance",
+        "fam-4": "Neoclassical", "fam-5": "Art Nouveau", "fam-6": "Modernism",
+        "fam-7": "Mughal", "fam-8": "Khmer", "fam-9": "Byzantine", "fam-10": "Chinese",
+        // 12 evidence dimensions
+        "dim-massing": "Massing", "dim-roof": "Roof", "dim-supports": "Supports", "dim-arch": "Arches",
+        "dim-openings": "Openings", "dim-facade": "Facade", "dim-ornament": "Ornament", "dim-material": "Material",
+        "dim-verticals": "Verticals", "dim-vault": "Vault / Dome", "dim-spatial": "Spatial org.", "dim-diagnostic": "Diagnostic"
     },
     vi: {
         "nav-home": "Trang chủ", "nav-features": "Tính năng", "nav-tech": "Công nghệ", "nav-try": "Dùng thử",
-        "hero-badge": "Nhận diện kiến trúc bằng AI",
-        "hero-title-1": "Thấu hiểu", "hero-title-2": "Linh hồn kiến trúc",
-        "hero-desc": "Hệ thống AI phân tích hình ảnh kiến trúc và trả về phong cách kiến trúc với điểm tin cậy cùng giải thích chi tiết.",
-        "hero-cta-1": "Thử ngay", "hero-cta-2": "Đăng nhập với Google", "hero-analysis-status": "Đang phân tích...",
-        "feat-title": "Công cụ phân tích chính xác", "feat-desc": "Mô hình thị giác tiên tiến của chúng tôi cung cấp cái nhìn sâu sắc về thẩm mỹ cấu trúc và bối cảnh lịch sử.",
-        "feat-1-h": "Phân tích AI", "feat-1-p": "Mạng nơ-ron sâu được đào tạo trên hàng triệu danh lam thắng cảnh toàn cầu.",
-        "feat-2-h": "Điểm tin cậy", "feat-2-p": "Nhận xác suất cho các ảnh hưởng phong cách chính và phụ.",
-        "feat-3-h": "Kết quả minh bạch", "feat-3-p": "Hiểu tại sao một phong cách được chọn với phân tích cấu trúc chi tiết.",
-        "feat-4-h": "Phát hiện thành phần", "feat-4-p": "Xác định các yếu tố như mái vòm, tháp nhọn, vòm cuốn hoặc cột xoắn.",
-        "styles-title": "Phong cách hỗ trợ", "styles-desc": "AI của chúng tôi nhận diện được dải rộng các trào lưu lịch sử và hiện đại.",
-        "comp-title": "Thành phần phát hiện (8 Loại)",
+        "hero-badge": "Nhận dạng phong cách kiến trúc mở",
+        "hero-title-1": "Nhận dạng", "hero-title-2": "100+ phong cách thế giới",
+        "hero-desc": "Hệ thống AI nhận diện phong cách kiến trúc từ một bức ảnh — hơn 100 phong cách toàn cầu, bao gồm cả kiến trúc phi phương Tây. Không cần danh sách cố định, không cần huấn luyện lại: hội đồng 3 giám khảo AI suy luận trên 12 chiều bằng chứng và tự từ chối khi chưa chắc chắn.",
+        "hero-cta-1": "Thử ngay", "hero-cta-2": "Đăng nhập với Google", "hero-analysis-status": "Hội đồng AI đang đồng thuận...",
+        "feat-title": "Hệ thống suy luận thế nào", "feat-desc": "Thay vì một bộ phân loại hộp đen, mỗi kết luận đều dựa trên bằng chứng, cơ sở tri thức và một hội đồng giám khảo AI độc lập.",
+        "feat-1-h": "Cơ sở tri thức mở", "feat-1-p": "106 phong cách thuộc 12 họ (Cổ đại → Đương đại, gồm Mughal, Khmer, Byzantine...). Thêm phong cách chỉ là thêm một dòng tri thức — không huấn luyện lại.",
+        "feat-2-h": "Hội đồng 3 giám khảo AI", "feat-2-p": "Gemini, DeepSeek và OpenAI chấm điểm ứng viên độc lập. Mức đồng thuận quyết định độ tin cậy; đồng thuận thấp → hệ thống từ chối kết luận.",
+        "feat-3-h": "Bằng chứng theo 12 chiều", "feat-3-p": "Khối tổng thể, mái, vòm, trang trí, vật liệu... — từng đặc trưng có tên được hiển thị rõ ràng rồi giải thích song ngữ Anh-Việt.",
+        "feat-4-h": "Lai & trung thực", "feat-4-p": "Công trình pha trộn được báo cáo dưới dạng hỗn hợp phong cách, không gán cứng một nhãn. Khi bằng chứng yếu, câu trả lời là \"chưa chắc — có thể là X / Y / Z\".",
+        "styles-title": "Một thế giới phong cách", "styles-desc": "Các họ phong cách tiêu biểu trong cơ sở tri thức 106 phong cách — cả phương Tây lẫn phi phương Tây.",
+        "comp-title": "12 chiều bằng chứng",
+        "comp-sub": "Những gì tác tử thị giác quan sát trong mỗi ảnh",
         "tech-title": "Nền tảng công nghệ",
-        "tech-1-h": "Mô hình thị giác", "tech-1-p": "Mạng nơ-ron tích chập độc quyền được tối ưu hóa cho hình học không gian.",
-        "tech-2-h": "Xác thực bảo mật", "tech-2-p": "Tích hợp Google OAuth 2.0 cho bảo mật cấp doanh nghiệp.",
-        "tech-3-h": "Hạ tầng đám mây", "tech-3-p": "Xử lý thời gian thực có thể mở rộng với triển khai cạnh toàn cầu.",
+        "tech-1-h": "Thị giác đa phương thức", "tech-1-p": "Gemini 2.5 Flash điền phiếu bằng chứng 12 chiều có cấu trúc trực tiếp từ ảnh.",
+        "tech-2-h": "Hội đồng đa LLM + Trọng tài", "tech-2-p": "Ba giám khảo độc lập cùng một trọng tài GPT-4o hợp nhất ý kiến dựa trên ảnh đầy đủ.",
+        "tech-3-h": "Cơ sở tri thức có nguồn", "tech-3-p": "106 phong cách neo theo Getty AAT, Wikidata và Banister Fletcher — mọi kết luận đều truy nguồn được.",
         "how-title": "Cách thức hoạt động",
         "how-1-h": "Đăng nhập Google", "how-1-p": "Xác thực an toàn để truy cập lịch sử phân tích cá nhân.",
-        "how-2-h": "Tải ảnh kiến trúc", "how-2-p": "Tải lên hình ảnh lên tới 10MB với độ phân giải cao.",
-        "how-3-h": "Nhận diện sâu", "how-3-p": "AI quét các vector cấu trúc và vật liệu.",
-        "how-4-h": "Báo cáo chi tiết", "how-4-p": "Nhận báo cáo toàn diện về phong cách và thành phần.",
-        "cta-title": "Sẵn sàng giải mã kiến trúc?", "cta-p": "Tải ảnh của bạn và khám phá phong cách kiến trúc ngay lập tức.", "cta-btn": "Bắt đầu phân tích",
-        "footer-copyright": "© 2026 ArchiAI. Bảo lưu mọi quyền. Trí tuệ kiến trúc chính xác.",
-        "style-gothic": "Gothic", "style-baroque": "Baroque", "style-renaissance": "Phục hưng",
-        "style-neoclassical": "Tân cổ điển", "style-artnouveau": "Art Nouveau", "style-artdeco": "Art Deco",
-        "style-modernism": "Hiện đại", "style-postmodernism": "Hậu hiện đại", "style-brutalism": "Thô mộc", "style-hitech": "Công nghệ cao"
+        "how-2-h": "Tải ảnh lên", "how-2-p": "Tải lên ảnh công trình tối đa 10MB (JPG, PNG, WEBP).",
+        "how-3-h": "Bằng chứng & Hội đồng", "how-3-p": "Tác tử thị giác trích bằng chứng; ứng viên được neo vào cơ sở tri thức; hội đồng 3 giám khảo chấm điểm.",
+        "how-4-h": "Kết quả song ngữ", "how-4-p": "Nhận hỗn hợp phong cách, bằng chứng theo từng phong cách và giải thích đầy đủ bằng Anh-Việt.",
+        "cta-title": "Sẵn sàng đọc vị mọi công trình?", "cta-p": "Tải ảnh lên và khám phá phong cách kiến trúc — ở bất kỳ đâu trên thế giới.", "cta-btn": "Bắt đầu phân tích",
+        "footer-copyright": "© 2026 ArchiAI — Nhận dạng Kiến trúc Mở (Open-Vocabulary)",
+        "footer-privacy": "Quyền riêng tư", "footer-terms": "Điều khoản",
+        "fam-1": "Gothic", "fam-2": "Baroque", "fam-3": "Phục Hưng",
+        "fam-4": "Tân cổ điển", "fam-5": "Art Nouveau", "fam-6": "Hiện đại",
+        "fam-7": "Mughal", "fam-8": "Khmer", "fam-9": "Byzantine", "fam-10": "Trung Hoa",
+        "dim-massing": "Khối tổng thể", "dim-roof": "Mái", "dim-supports": "Hệ đỡ", "dim-arch": "Vòm cuốn",
+        "dim-openings": "Cửa mở", "dim-facade": "Mặt tiền", "dim-ornament": "Trang trí", "dim-material": "Vật liệu",
+        "dim-verticals": "Yếu tố đứng", "dim-vault": "Vòm mái", "dim-spatial": "Tổ chức KG", "dim-diagnostic": "Chẩn đoán"
     }
 };
 
@@ -192,7 +206,15 @@ const globalCSS = `
   }
 `;
 
-function useT(lang) { return (k) => translations[lang][k] || k; }
+// Translation lookup with an optional CMS override layer: an admin-published
+// {en:{...},vi:{...}} map takes precedence over the hardcoded defaults; any key
+// the CMS does not override falls back to the built-in copy (backward-compat).
+function useT(lang, override) {
+    return (k) => {
+        const o = override && override[lang] && override[lang][k];
+        return (o != null && o !== '') ? o : (translations[lang][k] || k);
+    };
+}
 
 /* ── ScanButton – all CTA buttons use this ── */
 function ScanButton({ children, style, onMouseEnter, onMouseLeave, onClick, gradient = true }) {
@@ -260,7 +282,8 @@ function Navbar({ lang, toggleLang, dark, toggleTheme, t }) {
                         border: `1px solid ${dark ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.16)'}`,
                         color: dark ? '#e2e8f0' : '#1e293b',
                     }}>
-                        {lang.toUpperCase()}
+                        <Globe size={14} />
+                        <span>{lang.toUpperCase()}</span>
                     </button>
 
                     <button className="nav-ctrl" onClick={toggleTheme} style={{
@@ -411,8 +434,8 @@ function HeroSection({ dark, t }) {
 /* ── FEATURES 2×2 ── */
 function FeaturesSection({ dark, t }) {
     const list = [
-        { icon: <Brain size={22} />, color: '#00d2ff', hKey: 'feat-1-h', pKey: 'feat-1-p' },
-        { icon: <Gauge size={22} />, color: '#9d50bb', hKey: 'feat-2-h', pKey: 'feat-2-p' },
+        { icon: <BookOpen size={22} />, color: '#00d2ff', hKey: 'feat-1-h', pKey: 'feat-1-p' },
+        { icon: <Users size={22} />, color: '#9d50bb', hKey: 'feat-2-h', pKey: 'feat-2-p' },
         { icon: <SearchCheck size={22} />, color: '#00d2ff', hKey: 'feat-3-h', pKey: 'feat-3-p' },
         { icon: <Layers size={22} />, color: '#9d50bb', hKey: 'feat-4-h', pKey: 'feat-4-p' },
     ];
@@ -460,9 +483,9 @@ function FeatureCard({ icon, color, title, desc, dark }) {
 /* ── STYLES SECTION ── */
 function StylesSection({ dark, t }) {
     const list = [
-        { e: '🏰', k: 'style-gothic' }, { e: '🏛️', k: 'style-baroque' }, { e: '🎨', k: 'style-renaissance' },
-        { e: '⚖️', k: 'style-neoclassical' }, { e: '🌿', k: 'style-artnouveau' }, { e: '💎', k: 'style-artdeco' },
-        { e: '🏢', k: 'style-modernism' }, { e: '🧩', k: 'style-postmodernism' }, { e: '🧱', k: 'style-brutalism' }, { e: '🛰️', k: 'style-hitech' },
+        { e: '🏰', k: 'fam-1' }, { e: '🏛️', k: 'fam-2' }, { e: '🎨', k: 'fam-3' },
+        { e: '⚖️', k: 'fam-4' }, { e: '🌿', k: 'fam-5' }, { e: '🏢', k: 'fam-6' },
+        { e: '🕌', k: 'fam-7' }, { e: '🛕', k: 'fam-8' }, { e: '⛪', k: 'fam-9' }, { e: '🏯', k: 'fam-10' },
     ];
     return (
         <section style={{ padding: '96px 24px' }}>
@@ -472,7 +495,7 @@ function StylesSection({ dark, t }) {
                         <h2 style={{ fontSize: 36, fontWeight: 700, color: dark ? '#f9fafb' : '#0f172a' }}>{t('styles-title')}</h2>
                         <p style={{ color: dark ? '#94a3b8' : '#475569', marginTop: 8 }}>{t('styles-desc')}</p>
                     </div>
-                    <span style={{ padding: '5px 18px', borderRadius: 999, background: 'rgba(0,210,255,0.12)', color: '#00d2ff', fontSize: 11, fontWeight: 700, border: '1px solid rgba(0,210,255,0.38)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>10 Major Styles</span>
+                    <span style={{ padding: '5px 18px', borderRadius: 999, background: 'rgba(0,210,255,0.12)', color: '#00d2ff', fontSize: 11, fontWeight: 700, border: '1px solid rgba(0,210,255,0.38)', letterSpacing: '0.1em', textTransform: 'uppercase' }}>106 Styles · 12 Families</span>
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 16 }}>
                     {list.map((s, i) => <StyleCard key={i} emoji={s.e} label={t(s.k)} dark={dark} />)}
@@ -499,26 +522,27 @@ function StyleCard({ emoji, label, dark }) {
     );
 }
 
-/* ── COMPONENTS SECTION ── */
+/* ── EVIDENCE DIMENSIONS SECTION ── */
 function ComponentsSection({ dark, t }) {
-    const tags = ['arch', 'spire', 'dome', 'pediment',
-        'column_capital', 'solomonic_column', 'curved_iron_balcony', 'flat_roof'];
+    const keys = ['dim-massing', 'dim-roof', 'dim-supports', 'dim-arch',
+        'dim-openings', 'dim-facade', 'dim-ornament', 'dim-material',
+        'dim-verticals', 'dim-vault', 'dim-spatial', 'dim-diagnostic'];
     const colors = ['#00d2ff', '#9d50bb', '#00bcd4', '#a855f7',
-        '#22d3ee', '#c084fc', '#06b6d4', '#b45cf6'];
+        '#22d3ee', '#c084fc', '#06b6d4', '#b45cf6', '#38bdf8', '#d946ef', '#0ea5e9', '#a78bfa'];
 
     return (
         <section style={{
             padding: '96px 24px', position: 'relative', overflow: 'hidden',
-            /* #7 fix: always dark bg for this section regardless of mode */
+            /* always dark bg for this section regardless of mode */
             background: 'linear-gradient(135deg, #0f172a 0%, #1a1f35 60%, #0f172a 100%)',
         }}>
             <div style={{ position: 'absolute', top: 0, right: 0, width: 400, height: 400, background: 'rgba(157,80,187,0.13)', filter: 'blur(120px)', borderRadius: '50%', pointerEvents: 'none' }} />
             <div style={{ position: 'absolute', bottom: 0, left: 0, width: 300, height: 300, background: 'rgba(0,210,255,0.09)', filter: 'blur(100px)', borderRadius: '50%', pointerEvents: 'none' }} />
             <div style={{ maxWidth: 1280, margin: '0 auto', textAlign: 'center', position: 'relative', zIndex: 10 }}>
                 <h2 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8, color: '#f1f5f9' }}>{t('comp-title')}</h2>
-                <p style={{ color: '#64748b', fontSize: 14, marginBottom: 48 }}>Hover to explore architectural elements</p>
+                <p style={{ color: '#64748b', fontSize: 14, marginBottom: 48 }}>{t('comp-sub')}</p>
                 <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 12 }}>
-                    {tags.map((tag, i) => <CompTag key={i} label={tag} accent={colors[i % colors.length]} />)}
+                    {keys.map((k, i) => <CompTag key={i} label={t(k)} accent={colors[i % colors.length]} />)}
                 </div>
             </div>
         </section>
@@ -545,8 +569,8 @@ function CompTag({ label, accent }) {
 function TechSection({ dark, t }) {
     const techItems = [
         { icon: <Eye size={24} />, color: '#3b82f6', hKey: 'tech-1-h', pKey: 'tech-1-p' },
-        { icon: <ShieldCheck size={24} />, color: '#ef4444', hKey: 'tech-2-h', pKey: 'tech-2-p' },
-        { icon: <CloudUpload size={24} />, color: '#22c55e', hKey: 'tech-3-h', pKey: 'tech-3-p' },
+        { icon: <Users size={24} />, color: '#9d50bb', hKey: 'tech-2-h', pKey: 'tech-2-p' },
+        { icon: <BookOpen size={24} />, color: '#22c55e', hKey: 'tech-3-h', pKey: 'tech-3-p' },
     ];
     const steps = [
         { num: 1, color: '#00d2ff', hKey: 'how-1-h', pKey: 'how-1-p' },
@@ -658,6 +682,10 @@ function Footer({ dark, t }) {
                     </span>
                 </div>
                 <p style={{ color: dark ? '#64748b' : '#94a3b8', fontSize: 13 }}>{t('footer-copyright')}</p>
+                <div style={{ display: 'flex', gap: 18, alignItems: 'center' }}>
+                    <Link to="/privacy" style={{ color: dark ? '#94a3b8' : '#64748b', fontSize: 13, textDecoration: 'none', fontWeight: 600 }}>{t('footer-privacy')}</Link>
+                    <Link to="/terms" style={{ color: dark ? '#94a3b8' : '#64748b', fontSize: 13, textDecoration: 'none', fontWeight: 600 }}>{t('footer-terms')}</Link>
+                </div>
                 <div style={{ display: 'flex', gap: 12 }}>
                     {[
                         { label: 'X', icon: <XIcon /> },
@@ -733,19 +761,43 @@ function ScrollProgress() {
 
 /* ── APP ── */
 export default function App() {
-    const [lang, setLang] = useState('en');
-    const [dark, setDark] = useState(true);
-    const t = useT(lang);
+    const { theme, lang, toggleTheme, toggleLang } = useApp();
+    const dark = theme === 'dark';
+    const [cmsOverride, setCmsOverride] = useState(null);
+    const [previewLang, setPreviewLang] = useState(null);
+    const isPreview = new URLSearchParams(window.location.search).get('preview') === '1';
+    // Once a live edit arrives via postMessage, the parent owns the content; a
+    // late self-fetch must not clobber it (E3).
+    const liveRef = useRef(false);
+
+    // Load admin-managed content (CMS) and merge it over the defaults. In
+    // ?preview=1 mode an admin sees the unpublished draft, and live edits are
+    // pushed in via postMessage from the CMS editor (no server save).
+    useEffect(() => {
+        const load = isPreview ? getCmsDraftContent : getPublishedContent;
+        load('landing').then((res) => {
+            if (res && res.content && !liveRef.current) setCmsOverride(res.content);
+        }).catch(() => {});
+    }, [isPreview]);
 
     useEffect(() => {
-        const saved = localStorage.getItem('theme');
-        setDark(saved !== 'light');
-    }, []);
+        if (!isPreview) return;
+        const onMsg = (e) => {
+            if (e.origin !== window.location.origin) return;
+            if (e.data && e.data.source === 'archi-cms') {
+                if (e.data.page && e.data.page !== 'landing') return; // ignore other-page edits (E4)
+                liveRef.current = true;
+                if (e.data.content) setCmsOverride(e.data.content);
+                if (e.data.lang) setPreviewLang(e.data.lang);
+            }
+        };
+        window.addEventListener('message', onMsg);
+        // Tell the CMS editor we are ready to receive the current edits.
+        window.parent && window.parent.postMessage({ source: 'archi-cms-ready' }, window.location.origin);
+        return () => window.removeEventListener('message', onMsg);
+    }, [isPreview]);
 
-    const toggleTheme = () => setDark(prev => {
-        localStorage.setItem('theme', !prev ? 'dark' : 'light');
-        return !prev;
-    });
+    const t = useT(previewLang || lang, cmsOverride);
 
     return (
         <>
@@ -762,7 +814,7 @@ export default function App() {
                 <div className={`animated-gradient ${dark ? 'dark' : 'light'}`} aria-hidden="true" />
                 <ScrollProgress />
                 <div style={{ position: 'relative', zIndex: 1 }}>
-                    <Navbar lang={lang} toggleLang={() => setLang(l => l === 'en' ? 'vi' : 'en')} dark={dark} toggleTheme={toggleTheme} t={t} />
+                    <Navbar lang={lang} toggleLang={toggleLang} dark={dark} toggleTheme={toggleTheme} t={t} />
                     <HeroSection dark={dark} t={t} />
                     <Reveal><FeaturesSection dark={dark} t={t} /></Reveal>
                     <Reveal><StylesSection dark={dark} t={t} /></Reveal>

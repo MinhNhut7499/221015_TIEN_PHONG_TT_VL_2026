@@ -23,17 +23,28 @@ class DeepSeekService:
         Args:
             api_key: DeepSeek API key.
             base_url: DeepSeek API base URL (default: https://api.deepseek.com/v1).
-            model: Model name (default: deepseek-chat).
+            model: Model name (e.g. deepseek-v4-flash).
         """
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
 
-    async def chat(self, prompt: str, temperature: float = 0.3) -> str:
+    @property
+    def model_name(self) -> str:
+        """Return the configured model name (single source for telemetry labels)."""
+        return self._model
+
+    async def chat(
+        self, prompt: str, temperature: float = 0.3, json_mode: bool = False
+    ) -> str:
         """Send a single-turn text prompt and return the raw response text.
 
         Args:
             prompt: Full prompt string (system + user combined as user message).
             temperature: Sampling temperature (lower = more deterministic).
+            json_mode: When True, request strict JSON output
+                (``response_format={"type": "json_object"}``) so the response is
+                always parseable. The prompt must mention JSON for the API to
+                accept this.
 
         Returns:
             Raw text content from DeepSeek.
@@ -41,11 +52,13 @@ class DeepSeekService:
         Raises:
             RuntimeError: If the API returns no content.
         """
+        extra = {"response_format": {"type": "json_object"}} if json_mode else {}
         response = await with_retry(
             lambda: self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
+                **extra,
             ),
             attempts=settings.LLM_MAX_RETRIES + 1,
             base_delay=settings.LLM_RETRY_BASE_DELAY_SEC,

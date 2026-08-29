@@ -2,11 +2,11 @@
 .env
 frontend/.env
 
-# ── Claude-related (CLI config, rules, project memory) ────────
+# ── Claude-related ───────────────────────────────────────────
 .claude/
 CLAUDE.md
 
-# ── Dataset (large image corpus, kept out of git) ─────────────
+# ── Dataset ───────────────────────────────────────────────────
 data/
 
 # ── Node / frontend build ─────────────────────────────────────
@@ -14,11 +14,11 @@ frontend/node_modules/
 frontend/dist/
 .dist/
 
-# ── Trained model weights (large binaries, keep out of git) ───
+# ── Trained model weights ─────────────────────────────────────
 *.pt
 models/
 
-# ── Python ────────────────────────────────────────────────────
+# ── Python ─────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 .venv/
@@ -28,3 +28,16 @@ venv/
 # ── Uploads / scratch ─────────────────────────────────────────
 utils/upload_temp/
 utils/download/
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+*.iml
+
+# ── Flutter generated files ──────────────────────────────────
+.flutter-plugins-dependencies
+.metadata
+
+# ── Local outputs / research artifacts ────────────────────────
+results/
+figures/
+MotSoTaiLieuLienQuan/

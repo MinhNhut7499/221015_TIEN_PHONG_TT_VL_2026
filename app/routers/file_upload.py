@@ -6,17 +6,16 @@ to the configured upload_temp directory with a UUID-based filename.
 """
 import uuid
 from pathlib import Path
+from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from app.config import settings
-from app.security.security import TokenError, get_token_subject
+from app.dependencies.auth import get_current_active_user
 from app.utils.helpers import ensure_directory, get_file_extension, validate_image_extension
 
 router = APIRouter()
-_bearer_scheme = HTTPBearer()
 
 
 # ── Response model ─────────────────────────────────────────────────────────────
@@ -30,26 +29,6 @@ class UploadResponse(BaseModel):
     size_bytes: int
     stored_path: str
     uploaded_by: str
-
-
-# ── Auth dependency ────────────────────────────────────────────────────────────
-
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
-) -> str:
-    """FastAPI dependency: validate Bearer token and return the user ID.
-
-    Raises:
-        HTTPException 401: If the token is absent, malformed, or expired.
-    """
-    try:
-        return get_token_subject(credentials.credentials)
-    except TokenError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -67,13 +46,13 @@ def get_current_user(
 )
 async def upload_image(
     file: UploadFile = File(..., description="Image file to upload"),
-    current_user: str = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
 ) -> UploadResponse:
     """Validate, store, and acknowledge an uploaded image file.
 
     Args:
         file: The multipart file received from the client.
-        current_user: The authenticated user's ID (injected by get_current_user).
+        current_user: The authenticated JWT payload (rejected if deactivated).
 
     Returns:
         UploadResponse with the assigned file_id and storage path.
@@ -81,6 +60,7 @@ async def upload_image(
     Raises:
         HTTPException 400: Missing filename.
         HTTPException 401: Invalid or missing JWT.
+        HTTPException 403: Account deactivated.
         HTTPException 413: File exceeds size limit.
         HTTPException 422: Unsupported file extension.
     """
@@ -101,7 +81,7 @@ async def upload_image(
         content_type=file.content_type or "application/octet-stream",
         size_bytes=len(content),
         stored_path=stored_path,
-        uploaded_by=current_user,
+        uploaded_by=current_user.get("sub", ""),
     )
 
 

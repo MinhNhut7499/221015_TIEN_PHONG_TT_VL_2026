@@ -96,8 +96,10 @@ def get_llm_service() -> BaseLLMService:
         return GeminiService(api_key=settings.LLM_API_KEY)
     """
     from app.config import settings  # local import avoids circular dependency at startup
+    from chatbot.services import provider_credentials
 
-    if settings.GEMINI_API_KEY:
+    gemini_cred = provider_credentials.get_credentials("gemini")
+    if gemini_cred.key:
         from chatbot.services.gemini_service import GeminiService as _GeminiLLM
 
         class _GeminiAdapter(BaseLLMService):
@@ -105,7 +107,7 @@ def get_llm_service() -> BaseLLMService:
 
             def __init__(self) -> None:
                 self._svc = _GeminiLLM(
-                    api_key=settings.GEMINI_API_KEY,
+                    api_key=gemini_cred.key,
                     model=settings.LLM_MODEL or "gemini-1.5-flash",
                 )
 

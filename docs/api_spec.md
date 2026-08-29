@@ -2,7 +2,7 @@
 
 Base URL (development): `http://localhost:8000`  
 All responses are `application/json` unless noted otherwise.  
-Interactive docs: `GET /docs` (Swagger UI) · `GET /redoc` (ReDoc)
+Interactive docs (Swagger UI `/docs`, ReDoc `/redoc`, OpenAPI `/openapi.json`) are **disabled** — the API surface is not exposed publicly. This document is the reference.
 
 ---
 
@@ -114,6 +114,76 @@ Authorization: Bearer <access_token>
 
 ---
 
+### `DELETE /auth/account`
+Delete the authenticated user's own account and data (Google Play / App Store
+self-service deletion). Requires auth for an **active** account.
+
+The account row is anonymised (name, email, picture, Google sub and password hash
+are scrubbed and `IsActive` set to false) and all the user's projects, uploaded
+images, physical files and analysis history are removed. Anonymised financial
+records (payment transactions, token ledger) are retained for accounting and
+carry no personal data. The operation is irreversible and idempotent: a repeat
+call on an already-deleted account returns `deleted: false` (or 403, since the
+token is now for an inactive account).
+
+**Headers**
+```
+Authorization: Bearer <access_token>
+```
+
+**Response 200**
+```json
+{
+  "deleted": true
+}
+```
+
+**Response 403** — Token missing/invalid, or the account is already deactivated/deleted.
+
+---
+
+### Hybrid mobile app login (Cloud-Sync Polling)
+
+Google login for the Flutter WebView app. The web (inside the app) registers a
+session, the app opens Google in a Chrome Custom Tab, the flutter callback stores
+the JWT pair against the session, and the web polls until it claims the token.
+All `session_id` / `state` values must be **UUID v4**; sessions are one-time use
+and expire after `LOGIN_SESSION_TTL_MIN` (default 10 minutes). Requires the
+`LoginSessions` table.
+
+#### `POST /auth/login-session`
+Register (or reset) a pending session.
+
+**Request body**
+```json
+{ "session_id": "<uuid-v4>" }
+```
+**Response 200** — `{ "ok": true }`  
+**Response 400** — `session_id` is not a UUID v4.
+
+#### `GET /auth/login-session/{session_id}`
+Poll a session for its token (consumed on the first `completed` read).
+
+**Response 200**
+```json
+{ "status": "pending" | "completed" | "expired",
+  "access_token": "<jwt|null>", "refresh_token": "<jwt|null>" }
+```
+**Response 400** — `session_id` is not a UUID v4.
+
+#### `GET /auth/google/login/flutter?session_id=<uuid-v4>`
+Opened by the app in a Chrome Custom Tab. **Response 307** — redirect to Google's
+consent screen with `state=session_id`. **400** if `session_id` is not a UUID v4.
+
+#### `GET /auth/google/callback/flutter?code=...&state=<uuid-v4>`
+Google's redirect target (registered as `GOOGLE_FLUTTER_REDIRECT_URI`). Verifies
+the session is still pending, exchanges the code, and stores the JWT pair against
+the session. Returns an **HTML** page (`text/html`) telling the user to close the
+tab. A forged/unknown/expired `state` is rejected (HTML error, **400**) *before*
+any Google exchange or account creation.
+
+---
+
 ## 3. File Upload Endpoints
 
 ### `POST /upload/image`
@@ -215,11 +285,15 @@ all three LLM API keys configured (otherwise **503**).
   "degraded": false,
   "warnings": [],
   "certainty_margin": 0.27,
-  "distribution_entropy": 0.94
+  "distribution_entropy": 0.94,
+  "image_id": "a1b2c3d4-..."
 }
 ```
 
 Notes:
+- `image_id` is the persisted `Images.ImageId` of this analysis (or `null` when
+  the result was not persisted, e.g. test/legacy tokens). The frontend uses it to
+  open the follow-up Q&A (`POST /analyze/{image_id}/ask`) for the just-analysed image.
 - `bounding_box` is the YOLO pixel-space box (in the source image's coordinate
   space) used by the frontend to draw the detection overlay.
 - `gradcam_b64` is a PNG heatmap overlay from the ResNet50 style head, populated
@@ -242,19 +316,114 @@ Retrieve the authenticated user's past analyses (newest first).
     {
       "image_id": "...",
       "image_path": "utils/upload_temp/...jpg",
+      "file_id": "550e8400-e29b-41d4-a716-446655440000",
       "analysis_status": "completed",
       "uploaded_at": "2026-06-06T10:00:00+00:00",
       "style": "Gothic",
-      "confidence": 0.62
+      "confidence": 0.62,
+      "has_detail": true
     }
   ],
   "total": 1
 }
 ```
 
+`has_detail` is true when the full result (DetailJson) was persisted and the
+analysis can be re-opened with full fidelity.
+
 ---
 
-## 5. JWT Token Structure
+### `GET /analyze/history/{image_id}`
+Re-open a past analysis. Returns the full stored `AnalyzeResponse` JSON
+(`DetailJson`) when available, or a summary built from the persisted
+style/confidence/explanation/evidence for analyses created before full-result
+persistence existed. Requires auth; only the owner can read it.
+
+**Response 200** — same shape as `POST /analyze` (full), or a summary subset
+(`style`, `confidence`, `explanation`, `key_evidence`, empty `components`).
+Both include `image_id` and `file_id`.
+
+**Response 404** — Image does not exist or is not owned by the caller.
+
+---
+
+### `GET /analyze/image/{image_id}`
+Stream the original uploaded image for one of the caller's analyses (used to
+re-display the image when re-opening a past analysis). Requires auth.
+
+**Response 200** — the image file (`image/*`).
+
+**Response 404** — Not owned, or the file is no longer on disk.
+
+---
+
+### `POST /analyze/{image_id}/ask`
+Ask a grounded follow-up question about one of the caller's stored analyses. The
+answer is grounded in that analysis's evidence + KB candidate styles (gated mode:
+image-specific questions answered strictly from the analysis; general architecture
+knowledge is allowed but flagged; off-topic questions are declined). Requires auth.
+Stateless — the client sends prior turns in `history`.
+
+**Request body (JSON)**
+```json
+{
+  "question": "Why not Romanesque?",
+  "history": [
+    { "role": "user", "content": "What is the primary style?" },
+    { "role": "assistant", "content": "Gothic, at 55%." }
+  ],
+  "lang": "vi"
+}
+```
+
+**Response 200**
+```json
+{ "answer": "Vì phiếu bằng chứng ghi vòm nhọn và nhấn mạnh chiều đứng..." }
+```
+
+**Response 404** — Image not owned by the caller.
+
+**Response 503** — Q&A not configured (`DEEPSEEK_API_KEY` missing).
+
+---
+
+## 5. Knowledge Endpoints
+
+Read-only access to the architectural-style knowledge base (no DB, no LLM).
+Both endpoints require auth.
+
+### `GET /knowledge/style?name=<free-text>`
+Resolve a free-text style name (exact → alias → fuzzy) to its knowledge card.
+
+**Response 200**
+```json
+{
+  "id": "gothic",
+  "name": "Gothic",
+  "aliases": ["Gothic Revival", "..."],
+  "family_id": "medieval-european",
+  "family_name": "Medieval European",
+  "region": ["Western Europe"],
+  "period": "1140-1500",
+  "defining_features": ["pointed arches", "flying buttresses", "..."],
+  "expected_profile": { "arch": "pointed", "...": "..." },
+  "description": "...",
+  "references": ["AAT", "Wikidata P149"],
+  "aat_id": "TBD",
+  "wikidata_id": "TBD",
+  "siblings": [{ "id": "romanesque", "name": "Romanesque" }]
+}
+```
+
+**Response 404** — No KB entry matches the name.
+
+### `GET /knowledge/style/{style_id}`
+Same card, looked up by exact KB id (used when navigating between sibling styles).
+**Response 404** if the id is unknown.
+
+---
+
+## 6. JWT Token Structure
 
 ### Access Token Payload
 ```json
@@ -280,7 +449,7 @@ Retrieve the authenticated user's past analyses (newest first).
 
 ---
 
-## 6. Error Response Format
+## 7. Error Response Format
 
 All error responses follow FastAPI's default structure:
 ```json

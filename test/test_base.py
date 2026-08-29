@@ -42,11 +42,9 @@ async def test_upload_without_token_returns_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_openapi_schema_is_accessible() -> None:
-    """GET /openapi.json should return a valid OpenAPI schema."""
+async def test_api_docs_pages_are_disabled() -> None:
+    """The API documentation pages are disabled (not exposed publicly)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/openapi.json")
-    assert response.status_code == 200
-    schema = response.json()
-    assert "openapi" in schema
-    assert "paths" in schema
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            response = await client.get(path)
+            assert response.status_code == 404, path
